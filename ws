@@ -3,13 +3,13 @@ set -euo pipefail
 
 # ─────────────────────────────────────────────
 # ws — Workspace manager for Laravel + Claude Code
-# Crée des worktrees isolés avec Herd, DB, et dépendances auto
+# Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
 VERSION="2.0.0"
 WORKTREES_DIR=".worktrees"
 
-# ── Couleurs ──
+# ── Colors ──
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -27,7 +27,7 @@ warn()    { echo -e "${YELLOW}⚠${NC} $1"; }
 error()   { echo -e "${RED}✗${NC} $1" >&2; }
 header()  { echo -e "\n${BOLD}$1${NC}"; }
 
-# Trouve la racine du projet git le plus proche
+# Find the nearest git project root
 find_project_root() {
     local dir="$PWD"
     while [[ "$dir" != "/" ]]; do
@@ -37,21 +37,21 @@ find_project_root() {
         fi
         dir="$(dirname "$dir")"
     done
-    error "Pas de dépôt git trouvé dans l'arborescence."
+    error "No git repository found in the directory tree."
     exit 1
 }
 
-# Nom du projet depuis le dossier
+# Project name from directory
 project_name() {
     basename "$(find_project_root)"
 }
 
-# Slug propre pour le nom de branche (feature/auth → feature-auth)
+# Clean slug for branch name (feature/auth → feature-auth)
 slugify() {
     echo "$1" | sed 's/[\/]/-/g' | sed 's/[^a-zA-Z0-9._-]/-/g' | tr '[:upper:]' '[:lower:]'
 }
 
-# Nom complet du site: projet-branche
+# Full site name: project-branch
 site_name() {
     local proj
     proj="$(project_name)"
@@ -60,7 +60,7 @@ site_name() {
     echo "${proj}-${slug}"
 }
 
-# Chemin du worktree (utilise le site_name pour le dossier)
+# Worktree path (uses site_name for the directory)
 worktree_path() {
     local root
     root="$(find_project_root)"
@@ -69,7 +69,7 @@ worktree_path() {
     echo "$root/$WORKTREES_DIR/$sname"
 }
 
-# Vérifie qu'on est dans un worktree et retourne son chemin
+# Check if we're inside a worktree and return its path
 detect_current_worktree() {
     if [[ "$PWD" == *"$WORKTREES_DIR"* ]]; then
         echo "$PWD"
@@ -78,14 +78,14 @@ detect_current_worktree() {
     return 1
 }
 
-# Détecte la branche par défaut du repo (main, master, develop...)
+# Detect the default branch (main, master, develop...)
 detect_default_branch() {
     local root
     root="$(find_project_root)"
     local branch
     branch=$(git -C "$root" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
     if [[ -z "$branch" ]]; then
-        # Fallback: essayer main, puis master
+        # Fallback: try main, then master
         if git -C "$root" show-ref --verify --quiet refs/heads/main 2>/dev/null; then
             branch="main"
         elif git -C "$root" show-ref --verify --quiet refs/heads/master 2>/dev/null; then
@@ -97,17 +97,17 @@ detect_default_branch() {
     echo "$branch"
 }
 
-# Détecte si le site Herd utilise HTTPS (vérifie les certificats Herd)
+# Detect if the Herd site uses HTTPS (checks Herd certificates)
 detect_herd_secure() {
     local sname="$1"
-    # Herd stocke les certificats dans ~/.config/herd/ssl
+    # Herd stores certificates in ~/.config/herd/ssl
     if [[ -f "$HOME/.config/herd/ssl/${sname}.test.crt" ]]; then
         return 0  # HTTPS
     fi
     return 1  # HTTP
 }
 
-# Retourne le protocol à utiliser pour le site
+# Return the protocol to use for the site
 site_protocol() {
     local sname="$1"
     if detect_herd_secure "$sname"; then
@@ -121,7 +121,7 @@ site_protocol() {
 
 cmd_create() {
     local branch_name="${1:?Usage: ws create <branch-name>}"
-    local secure="${2:-}"  # --secure optionnel
+    local secure="${2:-}"
     local root
     root="$(find_project_root)"
     local sname
@@ -130,26 +130,26 @@ cmd_create() {
     wt_path="$(worktree_path "$branch_name")"
 
     if [[ -d "$wt_path" ]]; then
-        error "Le workspace '$sname' existe déjà: $wt_path"
+        error "Workspace '$sname' already exists: $wt_path"
         exit 1
     fi
 
-    header "Création du workspace: $sname"
+    header "Creating workspace: $sname"
 
-    # S'assurer que .worktrees est dans le .gitignore
+    # Ensure .worktrees is in .gitignore
     if ! grep -qx "$WORKTREES_DIR" "$root/.gitignore" 2>/dev/null; then
         echo "$WORKTREES_DIR" >> "$root/.gitignore"
-        success ".worktrees ajouté au .gitignore"
+        success ".worktrees added to .gitignore"
     fi
 
-    # Créer le worktree
-    info "Création du worktree sur branche '$branch_name'..."
+    # Create the worktree
+    info "Creating worktree on branch '$branch_name'..."
     cd "$root"
     git worktree add "$wt_path" -b "$branch_name" 2>/dev/null || \
     git worktree add "$wt_path" "$branch_name"
-    success "Worktree créé: $wt_path"
+    success "Worktree created: $wt_path"
 
-    # ── Auto-détection et setup ──
+    # ── Auto-detection and setup ──
     cd "$wt_path"
     _setup_env "$root" "$sname" "$secure"
     _setup_composer
@@ -159,21 +159,21 @@ cmd_create() {
     _setup_vite
     _clear_cache
 
-    # ── Récap post-création ──
+    # ── Post-creation summary ──
     local proto
     proto="$(site_protocol "$sname")"
     local url="${proto}://${sname}.test"
 
     echo ""
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}✓${NC} ${BOLD}Workspace prêt!${NC}"
+    echo -e "${GREEN}✓${NC} ${BOLD}Workspace ready!${NC}"
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     echo -e "  ${BOLD}URL${NC}       ${CYAN}${url}${NC}"
-    echo -e "  ${BOLD}Branche${NC}   ${branch_name}"
+    echo -e "  ${BOLD}Branch${NC}    ${branch_name}"
     echo -e "  ${BOLD}Path${NC}      ${DIM}${wt_path}${NC}"
 
-    # Afficher la DB si configurée
+    # Show DB if configured
     if [[ -f "$wt_path/.env" ]]; then
         local ws_db
         ws_db=$(grep "^DB_DATABASE=" "$wt_path/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
@@ -183,9 +183,9 @@ cmd_create() {
     fi
 
     echo ""
-    echo -e "  ${DIM}Commencer :${NC}           cd ${wt_path}"
-    echo -e "  ${DIM}Lancer Claude Code :${NC}  ws run"
-    echo -e "  ${DIM}Ouvrir le site :${NC}      ws preview"
+    echo -e "  ${DIM}Get started:${NC}           cd ${wt_path}"
+    echo -e "  ${DIM}Launch Claude Code:${NC}   ws run"
+    echo -e "  ${DIM}Open in browser:${NC}      ws preview"
     echo ""
 }
 
@@ -196,23 +196,23 @@ _setup_env() {
     local sname="$2"
     local secure="${3:-}"
 
-    # Déterminer le protocol
+    # Determine protocol
     local proto="http"
     if [[ "$secure" == "--secure" ]]; then
         proto="https"
     fi
 
     if [[ -f "$root/.env" ]]; then
-        # Copier le .env du projet principal (plus fiable que .env.example)
+        # Copy .env from main project (more reliable than .env.example)
         cp "$root/.env" .env
-        success ".env copié depuis le projet principal"
+        success ".env copied from main project"
     elif [[ -f ".env.example" ]]; then
         cp .env.example .env
-        success ".env créé depuis .env.example"
+        success ".env created from .env.example"
     fi
 
     if [[ ! -f ".env" ]]; then
-        warn "Pas de .env trouvé"
+        warn "No .env found"
         return 0
     fi
 
@@ -226,10 +226,10 @@ _setup_env() {
         echo "SESSION_DOMAIN=${sname}.test" >> .env
     fi
 
-    # SANCTUM_STATEFUL_DOMAINS (si Sanctum est utilisé)
+    # SANCTUM_STATEFUL_DOMAINS (if Sanctum is used)
     if grep -q "sanctum" composer.json 2>/dev/null; then
         if grep -q "^SANCTUM_STATEFUL_DOMAINS=" .env 2>/dev/null; then
-            # Ajouter le domaine du worktree à la liste existante
+            # Append the worktree domain to the existing list
             local current_domains
             current_domains=$(grep "^SANCTUM_STATEFUL_DOMAINS=" .env | cut -d= -f2 | tr -d '"' | tr -d "'")
             if [[ -n "$current_domains" ]]; then
@@ -240,7 +240,7 @@ _setup_env() {
         else
             echo "SANCTUM_STATEFUL_DOMAINS=${sname}.test" >> .env
         fi
-        success "SANCTUM_STATEFUL_DOMAINS mis à jour"
+        success "SANCTUM_STATEFUL_DOMAINS updated"
     fi
 
     # SESSION_SECURE_COOKIE
@@ -258,16 +258,16 @@ _setup_env() {
         fi
     fi
 
-    # Générer APP_KEY si c'est Laravel et que la clé est vide
+    # Generate APP_KEY if Laravel and key is empty
     if [[ -f "artisan" ]]; then
         local current_key
         current_key=$(grep "^APP_KEY=" .env 2>/dev/null | cut -d= -f2)
         if [[ -z "$current_key" || "$current_key" == "base64:" ]]; then
-            php artisan key:generate --quiet 2>/dev/null && success "APP_KEY générée" || true
+            php artisan key:generate --quiet 2>/dev/null && success "APP_KEY generated" || true
         fi
     fi
 
-    success ".env configuré (APP_URL=${proto}://${sname}.test)"
+    success ".env configured (APP_URL=${proto}://${sname}.test)"
 }
 
 _setup_composer() {
@@ -276,10 +276,10 @@ _setup_composer() {
     fi
 
     if [[ ! -d "vendor" ]]; then
-        info "Installation des dépendances Composer..."
+        info "Installing Composer dependencies..."
         composer install --quiet --no-interaction 2>/dev/null && \
-            success "Composer install terminé" || \
-            warn "Composer install a échoué — à faire manuellement"
+            success "Composer install done" || \
+            warn "Composer install failed — do it manually"
     fi
 }
 
@@ -289,10 +289,10 @@ _setup_npm() {
     fi
 
     if [[ ! -d "node_modules" ]]; then
-        info "Installation des dépendances NPM..."
+        info "Installing NPM dependencies..."
         npm install --silent 2>/dev/null && \
-            success "NPM install terminé" || \
-            warn "NPM install a échoué — à faire manuellement"
+            success "NPM install done" || \
+            warn "NPM install failed — do it manually"
     fi
 }
 
@@ -304,7 +304,7 @@ _setup_database() {
         return 0
     fi
 
-    # Lire la config DB depuis le .env du projet principal (avant nos modifications)
+    # Read DB config from main project .env (before our modifications)
     local source_env="${root:+$root/.env}"
     [[ -z "$source_env" || ! -f "$source_env" ]] && source_env=".env"
 
@@ -319,10 +319,10 @@ _setup_database() {
     branch_slug="$(slugify "$branch_name")"
     local workspace_db="${original_db}_${branch_slug//-/_}"
 
-    # Mettre à jour le .env avec la nouvelle DB
+    # Update .env with the new DB
     sed -i '' "s|^DB_DATABASE=.*|DB_DATABASE=$workspace_db|" .env 2>/dev/null || true
 
-    # Lire les credentials depuis le .env du workspace, avec defaults Laravel
+    # Read credentials from workspace .env, with Laravel defaults
     local db_connection db_user db_pass db_host db_port
     db_connection=$(grep "^DB_CONNECTION=" .env | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
     db_user=$(grep "^DB_USERNAME=" .env | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
@@ -341,9 +341,9 @@ _setup_database() {
                     -h"$db_host" \
                     ${db_port:+-P"$db_port"} \
                     -e "CREATE DATABASE IF NOT EXISTS \`$workspace_db\`;" 2>/dev/null; then
-                    success "Base de données '$workspace_db' créée (MySQL)"
+                    success "Database '$workspace_db' created (MySQL)"
                 else
-                    warn "Impossible de créer la DB — à faire manuellement"
+                    warn "Could not create database — do it manually"
                 fi
             fi
             ;;
@@ -359,53 +359,53 @@ _setup_database() {
                 local psql_args=(-U "$db_user" -h "$db_host")
                 [[ -n "${db_port:-}" ]] && psql_args+=(-p "$db_port")
 
-                # Se connecter à la DB source pour créer la nouvelle
+                # Connect to source DB to create the new one
                 if PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d "$original_db" \
                     -c "CREATE DATABASE \"$workspace_db\";" 2>/dev/null; then
-                    success "Base de données '$workspace_db' créée (PostgreSQL)"
+                    success "Database '$workspace_db' created (PostgreSQL)"
                 else
-                    warn "Impossible de créer la DB — à faire manuellement"
+                    warn "Could not create database — do it manually"
                 fi
 
-                # Recréer le search_path (schema) si défini
+                # Recreate the search_path (schema) if defined
                 local search_path=""
                 search_path=$(grep "^DB_SEARCH_PATH=" .env | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
                 if [[ -n "$search_path" ]]; then
                     if PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d "$workspace_db" \
                         -c "CREATE SCHEMA IF NOT EXISTS \"$search_path\";" 2>/dev/null; then
-                        success "Schema '$search_path' créé"
+                        success "Schema '$search_path' created"
                     else
-                        warn "Impossible de créer le schema — à faire manuellement"
+                        warn "Could not create schema — do it manually"
                     fi
                 fi
             else
-                warn "psql non trouvé — DB PostgreSQL à créer manuellement"
+                warn "psql not found — create PostgreSQL database manually"
             fi
             ;;
         sqlite)
             local db_path="database/database.sqlite"
             if [[ ! -f "$db_path" ]]; then
                 touch "$db_path"
-                success "Fichier SQLite créé"
+                success "SQLite file created"
             fi
             ;;
     esac
 
-    # Lancer les migrations
-    info "Exécution des migrations..."
+    # Run migrations
+    info "Running migrations..."
     if php artisan migrate --quiet --no-interaction 2>/dev/null; then
-        success "Migrations exécutées"
+        success "Migrations done"
     else
-        warn "Migrations échouées — à faire manuellement"
+        warn "Migrations failed — do it manually"
     fi
 
-    # Seeder si DatabaseSeeder existe
+    # Seed if DatabaseSeeder exists
     if [[ -f "database/seeders/DatabaseSeeder.php" ]]; then
-        info "Exécution des seeders..."
+        info "Running seeders..."
         if php artisan db:seed --quiet --no-interaction 2>/dev/null; then
-            success "Seeders exécutés"
+            success "Seeders done"
         else
-            warn "Seeders échoués — à faire manuellement"
+            warn "Seeders failed — do it manually"
         fi
     fi
 }
@@ -416,20 +416,20 @@ _setup_herd() {
     local wt_path="${3:-$PWD}"
 
     if ! command -v herd &>/dev/null; then
-        warn "Herd non détecté dans le PATH"
+        warn "Herd not found in PATH"
         return 0
     fi
 
-    info "Liaison avec Herd..."
+    info "Linking with Herd..."
     (cd "$wt_path" && herd link "$sname") 2>/dev/null && \
         success "Herd link: $sname.test" || \
-        { warn "Herd link a échoué — à faire manuellement"; return 0; }
+        { warn "Herd link failed — do it manually"; return 0; }
 
-    # Sécuriser si demandé
+    # Secure if requested
     if [[ "$secure" == "--secure" ]]; then
         herd secure "$sname" 2>/dev/null && \
             success "Herd secure: https://$sname.test" || \
-            warn "Herd secure a échoué — à faire manuellement"
+            warn "Herd secure failed — do it manually"
     fi
 }
 
@@ -445,19 +445,19 @@ _setup_vite() {
         return 0
     fi
 
-    # Vérifier si host et cors sont configurés
+    # Check if host and cors are configured
     if ! grep -q "host:" "$vite_config" 2>/dev/null; then
-        info "Ajout de host: 'localhost' et cors: true dans $vite_config..."
-        # Injecter la config server dans le fichier vite
+        info "Adding host: 'localhost' and cors: true to $vite_config..."
+        # Inject server config into vite file
         if grep -q "server:" "$vite_config" 2>/dev/null; then
-            # server: existe déjà, vérifier/ajouter host et cors
+            # server: already exists, check/add host and cors
             if ! grep -q "host:" "$vite_config" 2>/dev/null; then
                 sed -i '' "/server:/a\\
 \\            host: 'localhost',\\
 \\            cors: true," "$vite_config" 2>/dev/null || true
             fi
         else
-            # Ajouter un bloc server après defineConfig
+            # Add a server block after defineConfig
             sed -i '' "/plugins:/i\\
 \\        server: {\\
 \\            host: 'localhost',\\
@@ -467,14 +467,14 @@ _setup_vite() {
         success "vite.config: host: 'localhost', cors: true"
     fi
 
-    # Tuer les process Vite existants qui pourraient interférer
+    # Kill existing Vite processes that might interfere
     if pgrep -f "node.*vite" &>/dev/null; then
-        warn "Des process Vite sont en cours d'exécution."
-        read -rp "Les tuer pour éviter les conflits de port ? (y/N): " kill_vite
+        warn "Vite processes are running."
+        read -rp "Kill them to avoid port conflicts? (y/N): " kill_vite
         if [[ "$kill_vite" =~ ^[yY]$ ]]; then
             pkill -f "node.*vite" 2>/dev/null || true
             rm -f public/hot 2>/dev/null || true
-            success "Process Vite arrêtés"
+            success "Vite processes killed"
         fi
     fi
 }
@@ -484,12 +484,12 @@ _clear_cache() {
         return 0
     fi
 
-    info "Nettoyage des caches Laravel..."
+    info "Clearing Laravel caches..."
     php artisan config:clear --quiet 2>/dev/null || true
     php artisan cache:clear --quiet 2>/dev/null || true
     php artisan route:clear --quiet 2>/dev/null || true
     php artisan view:clear --quiet 2>/dev/null || true
-    success "Caches Laravel nettoyés"
+    success "Laravel caches cleared"
 }
 
 # ── RUN ──
@@ -500,23 +500,23 @@ cmd_run() {
     if [[ -n "${1:-}" ]]; then
         wt_path="$(worktree_path "$1")"
         if [[ ! -d "$wt_path" ]]; then
-            error "Workspace '$(site_name "$1")' introuvable."
+            error "Workspace '$(site_name "$1")' not found."
             exit 1
         fi
     elif detect_current_worktree &>/dev/null; then
         wt_path="$(detect_current_worktree)"
     else
-        # À la racine: proposer les worktrees disponibles
+        # At project root: offer available worktrees
         local root
         root="$(find_project_root)"
         local wt_dir="$root/$WORKTREES_DIR"
 
         if [[ ! -d "$wt_dir" ]] || [[ -z "$(ls -A "$wt_dir" 2>/dev/null)" ]]; then
-            error "Aucun workspace trouvé. Utilise: ws create <branch-name>"
+            error "No workspace found. Use: ws create <branch-name>"
             exit 1
         fi
 
-        header "Workspaces disponibles:"
+        header "Available workspaces:"
         local i=1
         local workspaces=()
         for dir in "$wt_dir"/*/; do
@@ -531,24 +531,24 @@ cmd_run() {
         done
 
         echo ""
-        read -rp "Choisis un workspace (1-${#workspaces[@]}): " choice
+        read -rp "Choose a workspace (1-${#workspaces[@]}): " choice
 
         if [[ "$choice" -ge 1 && "$choice" -le "${#workspaces[@]}" ]] 2>/dev/null; then
             local selected="${workspaces[$((choice-1))]}"
             wt_path="$wt_dir/$selected"
         else
-            error "Choix invalide."
+            error "Invalid choice."
             exit 1
         fi
     fi
 
     local name
     name="$(basename "$wt_path")"
-    info "Lancement de Claude Code dans '$name'..."
+    info "Launching Claude Code in '$name'..."
     echo -e "${DIM}─────────────────────────────────────${NC}"
 
     if ! command -v claude &>/dev/null; then
-        error "Claude Code n'est pas installé ou pas dans le PATH."
+        error "Claude Code is not installed or not in PATH."
         exit 1
     fi
 
@@ -569,8 +569,8 @@ cmd_status() {
     echo ""
 
     if [[ ! -d "$wt_dir" ]] || [[ -z "$(ls -A "$wt_dir" 2>/dev/null)" ]]; then
-        echo -e "  ${DIM}Aucun workspace.${NC}"
-        echo -e "  ${DIM}Utilise: ws create <branch-name>${NC}"
+        echo -e "  ${DIM}No workspaces.${NC}"
+        echo -e "  ${DIM}Use: ws create <branch-name>${NC}"
         return 0
     fi
 
@@ -579,17 +579,17 @@ cmd_status() {
         local name branch commits_ahead db_status herd_status url_display dirty_flag
         name="$(basename "$dir")"
 
-        # Branche
+        # Branch
         branch=$(git -C "$dir" branch --show-current 2>/dev/null || echo "?")
 
-        # Changements non commités
+        # Uncommitted changes
         if [[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]; then
             dirty_flag=" ${YELLOW}●${NC}"
         else
             dirty_flag=""
         fi
 
-        # Commits d'avance
+        # Commits ahead
         commits_ahead=$(git -C "$dir" rev-list --count "$default_branch..HEAD" 2>/dev/null || echo "?")
 
         # DB
@@ -635,14 +635,14 @@ cmd_preview() {
     elif detect_current_worktree &>/dev/null; then
         sname="$(basename "$(detect_current_worktree)")"
     else
-        error "Usage: ws preview <branch-name> (ou lance depuis un worktree)"
+        error "Usage: ws preview <branch-name> (or run from a worktree)"
         exit 1
     fi
 
     local proto
     proto="$(site_protocol "$sname")"
     local url="${proto}://$sname.test"
-    info "Ouverture de $url..."
+    info "Opening $url..."
     open "$url"
 }
 
@@ -653,7 +653,7 @@ cmd_finish() {
     local root
     root="$(find_project_root)"
 
-    # Détecter le workspace
+    # Detect the workspace
     local wt_path sname wt_branch
 
     if [[ -n "$branch_name" ]]; then
@@ -663,14 +663,14 @@ cmd_finish() {
         wt_path="$(detect_current_worktree)"
         sname="$(basename "$wt_path")"
     else
-        # Proposer les worktrees disponibles
+        # Show available worktrees
         local wt_dir="$root/$WORKTREES_DIR"
         if [[ ! -d "$wt_dir" ]] || [[ -z "$(ls -A "$wt_dir" 2>/dev/null)" ]]; then
-            error "Aucun workspace trouvé."
+            error "No workspace found."
             exit 1
         fi
 
-        header "Quel workspace terminer ?"
+        header "Which workspace to finish?"
         local i=1
         local workspaces=()
         for dir in "$wt_dir"/*/; do
@@ -684,42 +684,42 @@ cmd_finish() {
             ((i++))
         done
         echo ""
-        read -rp "Choisis un workspace (1-${#workspaces[@]}): " choice
+        read -rp "Choose a workspace (1-${#workspaces[@]}): " choice
         if [[ "$choice" -ge 1 && "$choice" -le "${#workspaces[@]}" ]] 2>/dev/null; then
             sname="${workspaces[$((choice-1))]}"
             wt_path="$wt_dir/$sname"
         else
-            error "Choix invalide."
+            error "Invalid choice."
             exit 1
         fi
     fi
 
     if [[ ! -d "$wt_path" ]]; then
-        error "Workspace '$sname' introuvable."
+        error "Workspace '$sname' not found."
         exit 1
     fi
 
     wt_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
 
-    # Vérifier s'il y a des changements non commités
+    # Check for uncommitted changes
     if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
-        warn "Changements non commités dans '$sname'."
+        warn "Uncommitted changes in '$sname'."
     fi
 
-    header "Terminer le workspace '$sname' ($wt_branch)"
+    header "Finish workspace '$sname' ($wt_branch)"
     echo ""
-    echo -e "  ${CYAN}1)${NC} Créer une PR depuis le worktree ${DIM}(recommandé)${NC}"
-    echo -e "  ${CYAN}2)${NC} Merger dans la branche courante"
-    echo -e "  ${CYAN}3)${NC} Abandonner les changements"
+    echo -e "  ${CYAN}1)${NC} Create a PR from the worktree ${DIM}(recommended)${NC}"
+    echo -e "  ${CYAN}2)${NC} Merge into current branch"
+    echo -e "  ${CYAN}3)${NC} Abandon changes"
     echo ""
-    read -rp "Choix (1-3): " finish_choice
+    read -rp "Choice (1-3): " finish_choice
 
     case "$finish_choice" in
         1) _finish_pr "$sname" "$wt_path" "$wt_branch" "$root" ;;
         2) _finish_merge "$sname" "$wt_path" "$wt_branch" "$root" ;;
         3) _finish_abandon "$sname" "$wt_path" "$wt_branch" "$root" ;;
         *)
-            error "Choix invalide."
+            error "Invalid choice."
             exit 1
             ;;
     esac
@@ -730,33 +730,33 @@ _finish_pr() {
 
     cd "$wt_path"
 
-    # Commiter les changements non commités
+    # Commit uncommitted changes
     if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
         echo ""
-        read -rp "Message de commit: " commit_msg
+        read -rp "Commit message: " commit_msg
         git add -A
         git commit -m "$commit_msg"
-        success "Changements commités"
+        success "Changes committed"
     fi
 
     # Push
-    info "Push de la branche '$wt_branch'..."
+    info "Pushing branch '$wt_branch'..."
     git push -u origin "$wt_branch" 2>/dev/null && \
-        success "Branche pushée" || \
-        { error "Push échoué."; exit 1; }
+        success "Branch pushed" || \
+        { error "Push failed."; exit 1; }
 
-    # Créer la PR
+    # Create the PR
     if command -v gh &>/dev/null; then
         local default_branch
         default_branch="$(detect_default_branch)"
 
         echo ""
-        read -rp "Titre de la PR: " pr_title
+        read -rp "PR title: " pr_title
 
         echo ""
-        echo -e "  ${CYAN}1)${NC} Je rédige la description sur GitHub"
-        echo -e "  ${CYAN}2)${NC} Générer depuis le diff"
-        echo -e "  ${CYAN}3)${NC} Pas de description"
+        echo -e "  ${CYAN}1)${NC} I'll write the description on GitHub"
+        echo -e "  ${CYAN}2)${NC} Generate from diff"
+        echo -e "  ${CYAN}3)${NC} No description"
         echo ""
         read -rp "Description (1-3): " desc_choice
 
@@ -771,47 +771,47 @@ _finish_pr() {
         esac
 
         gh pr create --base "$default_branch" --title "$pr_title" --body "$pr_body" 2>/dev/null && \
-            success "PR créée!" || \
-            warn "Création de PR échouée — crée-la manuellement sur GitHub"
+            success "PR created!" || \
+            warn "PR creation failed — create it manually on GitHub"
     else
-        warn "gh CLI non installé — crée la PR manuellement sur GitHub"
+        warn "gh CLI not installed — create the PR manually on GitHub"
     fi
 
     echo ""
-    read -rp "Supprimer le workspace maintenant ? (y/N): " cleanup
+    read -rp "Delete the workspace now? (y/N): " cleanup
     if [[ "$cleanup" =~ ^[yY]$ ]]; then
         _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root"
     else
-        info "Le workspace reste disponible. Utilise 'ws destroy' pour le supprimer plus tard."
+        info "Workspace kept. Use 'ws destroy' to remove it later."
     fi
 }
 
 _finish_merge() {
     local sname="$1" wt_path="$2" wt_branch="$3" root="$4"
 
-    # Vérifier les changements non commités
+    # Check for uncommitted changes
     if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
-        warn "Il y a des changements non commités dans '$sname'."
-        read -rp "Les commiter avant de merger ? (Y/n): " do_commit
+        warn "There are uncommitted changes in '$sname'."
+        read -rp "Commit them before merging? (Y/n): " do_commit
         if [[ ! "$do_commit" =~ ^[nN]$ ]]; then
             cd "$wt_path"
             echo ""
-            read -rp "Message de commit: " commit_msg
+            read -rp "Commit message: " commit_msg
             git add -A
             git commit -m "$commit_msg"
-            success "Changements commités"
+            success "Changes committed"
         fi
     fi
 
-    header "Merge de '$wt_branch' dans la branche courante"
+    header "Merging '$wt_branch' into current branch"
 
     cd "$root"
     git merge "$wt_branch" --no-commit --no-ff && \
-        success "Merge réussi (non commité — vérifie avec git status)" || \
-        { error "Conflits détectés — résous-les manuellement."; exit 1; }
+        success "Merge successful (not committed — check with git status)" || \
+        { error "Conflicts detected — resolve them manually."; exit 1; }
 
     echo ""
-    read -rp "Supprimer le workspace ? (y/N): " cleanup
+    read -rp "Delete the workspace? (y/N): " cleanup
     if [[ "$cleanup" =~ ^[yY]$ ]]; then
         _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root"
     fi
@@ -820,10 +820,10 @@ _finish_merge() {
 _finish_abandon() {
     local sname="$1" wt_path="$2" wt_branch="$3" root="$4"
 
-    echo -e "\n${RED}${BOLD}Abandon du workspace '$sname'${NC}"
-    echo -e "  ${DIM}Tous les changements seront perdus.${NC}"
+    echo -e "\n${RED}${BOLD}Abandoning workspace '$sname'${NC}"
+    echo -e "  ${DIM}All changes will be lost.${NC}"
     echo ""
-    read -rp "Confirmer ? (y/N): " confirm
+    read -rp "Confirm? (y/N): " confirm
     [[ "$confirm" =~ ^[yY]$ ]] || exit 0
 
     _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root"
@@ -834,12 +834,12 @@ _finish_abandon() {
 _cleanup_workspace() {
     local sname="$1" wt_path="$2" wt_branch="$3" root="$4" keep_db="${5:-}"
 
-    # Tuer Vite si en cours dans le worktree
+    # Kill Vite if running in the worktree
     local vite_pids
     vite_pids=$(pgrep -f "node.*vite.*${sname}" 2>/dev/null || true)
     if [[ -n "$vite_pids" ]]; then
         echo "$vite_pids" | xargs kill 2>/dev/null || true
-        success "Process Vite arrêtés"
+        success "Vite processes killed"
     fi
 
     # Unlink Herd
@@ -849,9 +849,9 @@ _cleanup_workspace() {
             success "Herd unlink: $sname" || true
     fi
 
-    # Supprimer la DB
+    # Drop the DB
     if [[ "$keep_db" == "--keep-db" ]]; then
-        info "Base de données conservée"
+        info "Database kept"
     elif [[ -f "$wt_path/.env" ]]; then
         local ws_db db_connection db_user db_pass db_host db_port
         ws_db=$(grep "^DB_DATABASE=" "$wt_path/.env" | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
@@ -873,9 +873,9 @@ _cleanup_workspace() {
                             -h"$db_host" \
                             ${db_port:+-P"$db_port"} \
                             -e "DROP DATABASE IF EXISTS \`$ws_db\`;" 2>/dev/null; then
-                            success "Base de données '$ws_db' supprimée"
+                            success "Database '$ws_db' dropped"
                         else
-                            warn "Impossible de supprimer la DB '$ws_db'"
+                            warn "Could not drop database '$ws_db'"
                         fi
                     fi
                     ;;
@@ -893,9 +893,9 @@ _cleanup_workspace() {
 
                         if PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d postgres \
                             -c "DROP DATABASE IF EXISTS \"$ws_db\";" 2>/dev/null; then
-                            success "Base de données '$ws_db' supprimée"
+                            success "Database '$ws_db' dropped"
                         else
-                            warn "Impossible de supprimer la DB '$ws_db'"
+                            warn "Could not drop database '$ws_db'"
                         fi
                     fi
                     ;;
@@ -903,25 +903,25 @@ _cleanup_workspace() {
         fi
     fi
 
-    # Supprimer le worktree (s'assurer de ne pas être dedans)
+    # Remove the worktree (make sure we're not inside it)
     cd "$root"
     if git worktree remove "$wt_path" --force 2>/dev/null; then
-        success "Worktree supprimé"
+        success "Worktree removed"
     else
         rm -rf "$wt_path"
         git worktree prune 2>/dev/null || true
-        success "Worktree supprimé (force)"
+        success "Worktree removed (force)"
     fi
 
-    # Supprimer la branche
+    # Delete the branch
     if [[ -n "$wt_branch" ]]; then
         git branch -d "$wt_branch" 2>/dev/null && \
-            success "Branche '$wt_branch' supprimée" || \
-            warn "Branche '$wt_branch' non supprimée (pas encore mergée ?)"
+            success "Branch '$wt_branch' deleted" || \
+            warn "Branch '$wt_branch' not deleted (not merged yet?)"
     fi
 
     echo ""
-    success "Workspace '$sname' nettoyé."
+    success "Workspace '$sname' cleaned up."
 }
 
 # ── DESTROY (alias rapide) ──
@@ -948,19 +948,19 @@ cmd_destroy() {
     wt_path="$(worktree_path "$branch_name")"
 
     if [[ ! -d "$wt_path" ]]; then
-        error "Workspace '$sname' introuvable."
+        error "Workspace '$sname' not found."
         exit 1
     fi
 
     local wt_branch
     wt_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
 
-    echo -e "${RED}${BOLD}Suppression du workspace '$sname'${NC}"
+    echo -e "${RED}${BOLD}Deleting workspace '$sname'${NC}"
     echo -e "  Worktree: $wt_path"
-    echo -e "  Branche:  $wt_branch"
-    [[ -n "$keep_db" ]] && echo -e "  ${DIM}(base de données conservée)${NC}"
+    echo -e "  Branch:   $wt_branch"
+    [[ -n "$keep_db" ]] && echo -e "  ${DIM}(database kept)${NC}"
     echo ""
-    read -rp "Confirmer ? (y/N): " confirm
+    read -rp "Confirm? (y/N): " confirm
     [[ "$confirm" =~ ^[yY]$ ]] || exit 0
 
     _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root" "$keep_db"
@@ -970,31 +970,31 @@ cmd_destroy() {
 
 cmd_help() {
     echo ""
-    echo -e "${BOLD}ws${NC} v$VERSION — Workspace manager pour Laravel + Claude Code"
+    echo -e "${BOLD}ws${NC} v$VERSION — Workspace manager for Laravel + Claude Code"
     echo ""
     echo -e "${BOLD}Usage:${NC}"
-    echo -e "  ws create <branch> [--secure]   Crée un workspace isolé (worktree + env + db + herd)"
-    echo -e "  ws run [branch]                 Lance Claude Code dans le workspace"
-    echo -e "  ws status                       Affiche tous les workspaces et leur état"
-    echo -e "  ws preview [branch]             Ouvre le site dans le navigateur"
-    echo -e "  ws finish [branch]              Termine le travail (PR / merge / abandon)"
-    echo -e "  ws destroy <branch> [--keep-db]  Supprime le workspace et le lien Herd (--keep-db conserve la DB)"
-    echo -e "  ws help                         Affiche cette aide"
+    echo -e "  ws create <branch> [--secure]   Create an isolated workspace (worktree + env + db + herd)"
+    echo -e "  ws run [branch]                 Launch Claude Code in the workspace"
+    echo -e "  ws status                       Show all workspaces and their state"
+    echo -e "  ws preview [branch]             Open the site in the browser"
+    echo -e "  ws finish [branch]              Finish work (PR / merge / abandon)"
+    echo -e "  ws destroy <branch> [--keep-db]  Delete the workspace and Herd link (--keep-db keeps the DB)"
+    echo -e "  ws help                         Show this help"
     echo ""
-    echo -e "${BOLD}Exemples:${NC}"
-    echo -e "  ${DIM}cd ~/Users/Sites/valet/mon-projet${NC}"
-    echo -e "  ws create feature/auth               ${DIM}# HTTP par défaut${NC}"
-    echo -e "  ws create feature/auth --secure       ${DIM}# HTTPS avec herd secure${NC}"
+    echo -e "${BOLD}Examples:${NC}"
+    echo -e "  ${DIM}cd ~/Sites/my-project${NC}"
+    echo -e "  ws create feature/auth               ${DIM}# HTTP by default${NC}"
+    echo -e "  ws create feature/auth --secure       ${DIM}# HTTPS with herd secure${NC}"
     echo -e "  ws run feature/auth"
-    echo -e "  ws run                                ${DIM}# depuis le worktree, ou choix interactif${NC}"
+    echo -e "  ws run                                ${DIM}# from the worktree, or interactive choice${NC}"
     echo -e "  ws status"
     echo -e "  ws preview feature/auth"
-    echo -e "  ws finish                             ${DIM}# workflow guidé: PR, merge, ou abandon${NC}"
+    echo -e "  ws finish                             ${DIM}# guided workflow: PR, merge, or abandon${NC}"
     echo -e "  ws destroy feature/auth"
     echo ""
-    echo -e "${BOLD}Nommage:${NC}"
-    echo -e "  Le site Herd utilise le format ${CYAN}projet-branche.test${NC}"
-    echo -e "  Ex: projet ${DIM}mon-app${NC} + branche ${DIM}feature/login${NC} → ${CYAN}mon-app-feature-login.test${NC}"
+    echo -e "${BOLD}Naming:${NC}"
+    echo -e "  Herd sites use the format ${CYAN}project-branch.test${NC}"
+    echo -e "  E.g.: project ${DIM}my-app${NC} + branch ${DIM}feature/login${NC} → ${CYAN}my-app-feature-login.test${NC}"
     echo ""
 }
 
@@ -1014,7 +1014,7 @@ main() {
         destroy) cmd_destroy "$@" ;;
         help|-h|--help) cmd_help ;;
         *)
-            error "Commande inconnue: $command"
+            error "Unknown command: $command"
             cmd_help
             exit 1
             ;;

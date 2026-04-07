@@ -1,168 +1,168 @@
-# ws — Workspace manager pour Laravel + Claude Code
+# ws — Workspace manager for Laravel + Claude Code
 
-Crée des workspaces isolés via `git worktree`, avec setup automatique de Laravel Herd, base de données, dépendances, et session Claude Code.
+Creates isolated workspaces via `git worktree`, with automatic setup of Laravel Herd, database, dependencies, and Claude Code session.
 
-Inspiré par [Polyscope](https://getpolyscope.com/) et [laravel-herd-worktree](https://github.com/harris21/laravel-herd-worktree), sans dépendance à une app tierce.
+Inspired by [Polyscope](https://getpolyscope.com/) and [laravel-herd-worktree](https://github.com/harris21/laravel-herd-worktree), with no third-party app dependency.
 
 ## Installation
 
-Cloner le repo puis créer un symlink :
+Clone the repo and create a symlink:
 
 ```bash
 git clone git@github.com:parfaitementweb/workspaces.git /path/to/workspaces
 sudo ln -s /path/to/workspaces/ws /usr/local/bin/ws
 ```
 
-Comme c'est un symlink, un `git pull` dans le repo mettra à jour la commande `ws` partout.
+Since it's a symlink, a `git pull` in the repo will update the `ws` command everywhere.
 
-> Remplace `/path/to/workspaces` par l'emplacement réel du repo cloné sur ta machine.
+> Replace `/path/to/workspaces` with the actual location of the cloned repo on your machine.
 
-## Prérequis
+## Prerequisites
 
 - **Git** (git worktree)
-- **Laravel Herd** installé et dans le PATH
-- **Composer** et **npm**
-- **Claude Code** (`claude` dans le PATH)
-- **gh** (optionnel, pour créer des PRs depuis `ws finish`)
+- **Laravel Herd** installed and in PATH
+- **Composer** and **npm**
+- **Claude Code** (`claude` in PATH)
+- **gh** (optional, for creating PRs from `ws finish`)
 
 ## Usage
 
-Depuis la racine d'un projet Laravel :
+From the root of a Laravel project:
 
 ```bash
-cd ~/Users/Sites/valet/mon-projet
+cd ~/Sites/my-project
 ```
 
-### Créer un workspace
+### Create a workspace
 
 ```bash
-ws create feature/auth            # HTTP par défaut
+ws create feature/auth            # HTTP by default
 ws create feature/auth --secure   # HTTPS (herd secure)
 ```
 
-Ça fait tout automatiquement :
-- Crée un git worktree dans `.worktrees/mon-projet-feature-auth/`
-- Copie le `.env` du projet principal
-- Met à jour `APP_URL`, `SESSION_DOMAIN`, `SANCTUM_STATEFUL_DOMAINS`, `SESSION_SECURE_COOKIE`
-- Crée une base de données isolée (`monprojet_feature_auth`)
-- Lance `composer install` et `npm install`
-- Exécute les migrations et les seeders
-- Linke avec Herd → `http(s)://mon-projet-feature-auth.test`
-- Vérifie la config Vite (`host: 'localhost'`, `cors: true`)
-- Vide les caches Laravel
+Everything is handled automatically:
+- Creates a git worktree in `.worktrees/my-project-feature-auth/`
+- Copies `.env` from the main project
+- Updates `APP_URL`, `SESSION_DOMAIN`, `SANCTUM_STATEFUL_DOMAINS`, `SESSION_SECURE_COOKIE`
+- Creates an isolated database (`myproject_feature_auth`)
+- Runs `composer install` and `npm install`
+- Runs migrations and seeders
+- Links with Herd → `http(s)://my-project-feature-auth.test`
+- Checks Vite config (`host: 'localhost'`, `cors: true`)
+- Clears Laravel caches
 
-### Lancer Claude Code dans un workspace
+### Launch Claude Code in a workspace
 
 ```bash
-ws run feature/auth    # ouvre Claude Code dans le worktree
-ws run                 # choix interactif si plusieurs workspaces
+ws run feature/auth    # opens Claude Code in the worktree
+ws run                 # interactive choice if multiple workspaces
 ```
 
-Depuis un worktree, `ws run` sans argument lance Claude Code directement là où tu es.
+From a worktree, `ws run` without arguments launches Claude Code right where you are.
 
-### Voir l'état des workspaces
+### View workspace status
 
 ```bash
 ws status
 ```
 
 ```
-mon-projet — Workspaces
+my-project — Workspaces
 
-  mon-projet-feature-auth  (feature/auth) ●  +3  ✓ DB  ✓ Herd  → https://mon-projet-feature-auth.test
-  mon-projet-fix-header    (fix/header)      +1  ✓ DB  ✓ Herd  → http://mon-projet-fix-header.test
+  my-project-feature-auth  (feature/auth) ●  +3  ✓ DB  ✓ Herd  → https://my-project-feature-auth.test
+  my-project-fix-header    (fix/header)      +1  ✓ DB  ✓ Herd  → http://my-project-fix-header.test
 ```
 
-Le `●` jaune indique des changements non commités.
+The yellow `●` indicates uncommitted changes.
 
-### Ouvrir le site dans le navigateur
+### Open the site in the browser
 
 ```bash
 ws preview feature/auth
-ws preview                 # depuis un worktree
+ws preview                 # from a worktree
 ```
 
-Détecte automatiquement si le site est en HTTP ou HTTPS.
+Automatically detects whether the site is HTTP or HTTPS.
 
-### Terminer le travail
+### Finish work
 
 ```bash
-ws finish                  # workflow guidé
-ws finish feature/auth     # workspace spécifique
+ws finish                  # guided workflow
+ws finish feature/auth     # specific workspace
 ```
 
-Trois options :
-1. **Créer une PR** — commit, push, `gh pr create` (recommandé)
-2. **Merger localement** — `git merge --no-commit --no-ff` pour review
-3. **Abandonner** — supprime tout
+Three options:
+1. **Create a PR** — commit, push, `gh pr create` (recommended)
+2. **Merge locally** — `git merge --no-commit --no-ff` for review
+3. **Abandon** — deletes everything
 
-### Supprimer un workspace
+### Delete a workspace
 
 ```bash
-ws destroy feature/auth              # supprime tout (DB incluse)
-ws destroy feature/auth --keep-db    # conserve la base de données
+ws destroy feature/auth              # deletes everything (DB included)
+ws destroy feature/auth --keep-db    # keeps the database
 ```
 
-Supprime le worktree, la branche locale, la base de données, le lien Herd, et le certificat SSL si applicable. Utiliser `--keep-db` pour conserver la base de données.
+Deletes the worktree, local branch, database, Herd link, and SSL certificate if applicable. Use `--keep-db` to keep the database.
 
-## Nommage
+## Naming
 
-Le site Herd utilise le format `projet-branche.test` pour éviter les conflits entre projets :
+Herd sites use the format `project-branch.test` to avoid conflicts between projects:
 
-| Projet | Branche | Site Herd |
+| Project | Branch | Herd Site |
 |---|---|---|
-| `mon-app` | `feature/login` | `mon-app-feature-login.test` |
-| `autre-app` | `feature/login` | `autre-app-feature-login.test` |
+| `my-app` | `feature/login` | `my-app-feature-login.test` |
+| `other-app` | `feature/login` | `other-app-feature-login.test` |
 
 ## Structure
 
 ```
-mon-projet/
-├── .worktrees/                          # ignoré par git
-│   ├── mon-projet-feature-auth/         # worktree isolé
-│   │   ├── .env                         # APP_URL, DB, session configurés
-│   │   ├── vendor/                      # composer install dédié
-│   │   └── node_modules/               # npm install dédié
-│   └── mon-projet-fix-header/
+my-project/
+├── .worktrees/                          # ignored by git
+│   ├── my-project-feature-auth/         # isolated worktree
+│   │   ├── .env                         # APP_URL, DB, session configured
+│   │   ├── vendor/                      # dedicated composer install
+│   │   └── node_modules/               # dedicated npm install
+│   └── my-project-fix-header/
 ├── app/
 ├── composer.json
 └── ...
 ```
 
-## Ce qui est configuré automatiquement dans le .env
+## .env auto-configuration
 
-| Variable | Valeur |
+| Variable | Value |
 |---|---|
-| `APP_URL` | `http(s)://projet-branche.test` |
-| `DB_DATABASE` | `original_db_branche_slug` |
-| `SESSION_DOMAIN` | `projet-branche.test` |
-| `SANCTUM_STATEFUL_DOMAINS` | Domaine ajouté (si Sanctum détecté) |
-| `SESSION_SECURE_COOKIE` | `true` si --secure, `false` sinon |
+| `APP_URL` | `http(s)://project-branch.test` |
+| `DB_DATABASE` | `original_db_branch_slug` |
+| `SESSION_DOMAIN` | `project-branch.test` |
+| `SANCTUM_STATEFUL_DOMAINS` | Domain appended (if Sanctum detected) |
+| `SESSION_SECURE_COOKIE` | `true` if --secure, `false` otherwise |
 
-## Dépannage
+## Troubleshooting
 
-### 401 sur les routes API
-Le domaine du worktree n'est pas dans `SANCTUM_STATEFUL_DOMAINS`. Normalement configuré automatiquement. Vérifier avec `php artisan config:clear`.
+### 401 on API routes
+The worktree domain is not in `SANCTUM_STATEFUL_DOMAINS`. Normally configured automatically. Try `php artisan config:clear`.
 
-### Cookies rejetés
-`SESSION_DOMAIN` ne correspond pas au domaine Herd. Vérifier le `.env` du worktree.
+### Cookies rejected
+`SESSION_DOMAIN` doesn't match the Herd domain. Check the worktree `.env`.
 
-### Page blanche / erreurs CORS
-Vérifier que `vite.config.js` a `host: 'localhost'` et `cors: true`. Tuer les process Vite existants : `pkill -f "node.*vite"`.
+### Blank page / CORS errors
+Check that `vite.config.js` has `host: 'localhost'` and `cors: true`. Kill existing Vite processes: `pkill -f "node.*vite"`.
 
 ### Mixed Content (HTTPS)
-Si le site est sécurisé avec Herd, s'assurer que `APP_URL` est en `https://`. Utiliser `ws create <branch> --secure`.
+If the site is secured with Herd, make sure `APP_URL` is `https://`. Use `ws create <branch> --secure`.
 
-### Assets qui ne chargent pas
+### Assets not loading
 ```bash
 pkill -f "node.*vite"
 rm -f public/hot
 npm run dev
 ```
 
-### Migrations échouées
-La DB du worktree n'existe peut-être pas. Vérifier `DB_DATABASE` dans le `.env` et créer la base manuellement si nécessaire.
+### Migrations failed
+The worktree database might not exist. Check `DB_DATABASE` in `.env` and create the database manually if needed.
 
-## Licence
+## License
 
 MIT
