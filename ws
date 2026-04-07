@@ -183,6 +183,7 @@ cmd_create() {
     fi
 
     echo ""
+    echo -e "  ${DIM}Commencer :${NC}           cd ${wt_path}"
     echo -e "  ${DIM}Lancer Claude Code :${NC}  ws run"
     echo -e "  ${DIM}Ouvrir le site :${NC}      ws preview"
     echo ""
