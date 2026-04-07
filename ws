@@ -159,13 +159,32 @@ cmd_create() {
     _setup_vite
     _clear_cache
 
-    echo ""
+    # ── Récap post-création ──
     local proto
     proto="$(site_protocol "$sname")"
-    success "Workspace '$sname' prêt!"
-    echo -e "  ${DIM}cd $wt_path${NC}"
-    echo -e "  ${DIM}ws run${NC}"
-    echo -e "  ${CYAN}→ ${proto}://$sname.test${NC}"
+    local url="${proto}://${sname}.test"
+
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}✓${NC} ${BOLD}Workspace prêt!${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  ${BOLD}URL${NC}       ${CYAN}${url}${NC}"
+    echo -e "  ${BOLD}Branche${NC}   ${branch_name}"
+    echo -e "  ${BOLD}Path${NC}      ${DIM}${wt_path}${NC}"
+
+    # Afficher la DB si configurée
+    if [[ -f "$wt_path/.env" ]]; then
+        local ws_db
+        ws_db=$(grep "^DB_DATABASE=" "$wt_path/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+        if [[ -n "$ws_db" ]]; then
+            echo -e "  ${BOLD}Database${NC}  ${ws_db}"
+        fi
+    fi
+
+    echo ""
+    echo -e "  ${DIM}Lancer Claude Code :${NC}  ws run"
+    echo -e "  ${DIM}Ouvrir le site :${NC}      ws preview"
     echo ""
 }
 
