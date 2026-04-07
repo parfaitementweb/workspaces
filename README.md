@@ -44,8 +44,9 @@ ws create feature/auth --secure   # HTTPS (herd secure)
 - Crée un git worktree dans `.worktrees/mon-projet-feature-auth/`
 - Copie le `.env` du projet principal
 - Met à jour `APP_URL`, `SESSION_DOMAIN`, `SANCTUM_STATEFUL_DOMAINS`, `SESSION_SECURE_COOKIE`
-- Crée une base de données isolée (`mon_projet_feature_auth`)
+- Crée une base de données isolée (`monprojet_feature_auth`)
 - Lance `composer install` et `npm install`
+- Exécute les migrations et les seeders
 - Linke avec Herd → `http(s)://mon-projet-feature-auth.test`
 - Vérifie la config Vite (`host: 'localhost'`, `cors: true`)
 - Vide les caches Laravel
@@ -98,10 +99,11 @@ Trois options :
 ### Supprimer un workspace
 
 ```bash
-ws destroy feature/auth
+ws destroy feature/auth              # supprime tout (DB incluse)
+ws destroy feature/auth --keep-db    # conserve la base de données
 ```
 
-Supprime le worktree, la branche locale, la base de données, le lien Herd, et le certificat SSL si applicable.
+Supprime le worktree, la branche locale, la base de données, le lien Herd, et le certificat SSL si applicable. Utiliser `--keep-db` pour conserver la base de données.
 
 ## Nommage
 
@@ -132,7 +134,7 @@ mon-projet/
 | Variable | Valeur |
 |---|---|
 | `APP_URL` | `http(s)://projet-branche.test` |
-| `DB_DATABASE` | `original_db_projet_branche` |
+| `DB_DATABASE` | `original_db_branche_slug` |
 | `SESSION_DOMAIN` | `projet-branche.test` |
 | `SANCTUM_STATEFUL_DOMAINS` | Domaine ajouté (si Sanctum détecté) |
 | `SESSION_SECURE_COOKIE` | `true` si --secure, `false` sinon |

@@ -832,7 +832,7 @@ _finish_abandon() {
 # ── CLEANUP (shared) ──
 
 _cleanup_workspace() {
-    local sname="$1" wt_path="$2" wt_branch="$3" root="$4"
+    local sname="$1" wt_path="$2" wt_branch="$3" root="$4" keep_db="${5:-}"
 
     # Tuer Vite si en cours dans le worktree
     local vite_pids
@@ -850,29 +850,36 @@ _cleanup_workspace() {
     fi
 
     # Supprimer la DB
-    if [[ -f "$wt_path/.env" ]]; then
+    if [[ "$keep_db" == "--keep-db" ]]; then
+        info "Base de données conservée"
+    elif [[ -f "$wt_path/.env" ]]; then
         local ws_db db_connection db_user db_pass db_host db_port
-        ws_db=$(grep "^DB_DATABASE=" "$wt_path/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-        db_connection=$(grep "^DB_CONNECTION=" "$wt_path/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-        db_user=$(grep "^DB_USERNAME=" "$wt_path/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-        db_pass=$(grep "^DB_PASSWORD=" "$wt_path/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-        db_host=$(grep "^DB_HOST=" "$wt_path/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-        db_port=$(grep "^DB_PORT=" "$wt_path/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+        ws_db=$(grep "^DB_DATABASE=" "$wt_path/.env" | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
+        db_connection=$(grep "^DB_CONNECTION=" "$wt_path/.env" | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
+        db_user=$(grep "^DB_USERNAME=" "$wt_path/.env" | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
+        db_pass=$(grep "^DB_PASSWORD=" "$wt_path/.env" | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
+        db_host=$(grep "^DB_HOST=" "$wt_path/.env" | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
+        db_port=$(grep "^DB_PORT=" "$wt_path/.env" | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
+        db_user="${db_user:-root}"
+        db_host="${db_host:-127.0.0.1}"
 
-        case "$db_connection" in
-            mysql|mariadb)
-                if command -v mysql &>/dev/null && [[ -n "$ws_db" ]]; then
-                    mysql \
-                        -u"${db_user:-root}" \
-                        ${db_pass:+-p"$db_pass"} \
-                        ${db_host:+-h"$db_host"} \
-                        ${db_port:+-P"$db_port"} \
-                        -e "DROP DATABASE IF EXISTS \`$ws_db\`;" 2>/dev/null && \
-                        success "Base de données '$ws_db' supprimée" || true
-                fi
-                ;;
-            pgsql)
-                if [[ -n "$ws_db" ]]; then
+        if [[ -n "$ws_db" ]]; then
+            case "${db_connection:-}" in
+                mysql|mariadb)
+                    if command -v mysql &>/dev/null; then
+                        if mysql \
+                            -u"$db_user" \
+                            ${db_pass:+-p"$db_pass"} \
+                            -h"$db_host" \
+                            ${db_port:+-P"$db_port"} \
+                            -e "DROP DATABASE IF EXISTS \`$ws_db\`;" 2>/dev/null; then
+                            success "Base de données '$ws_db' supprimée"
+                        else
+                            warn "Impossible de supprimer la DB '$ws_db'"
+                        fi
+                    fi
+                    ;;
+                pgsql)
                     local psql_cmd=""
                     if command -v psql &>/dev/null; then
                         psql_cmd="psql"
@@ -881,18 +888,19 @@ _cleanup_workspace() {
                     fi
 
                     if [[ -n "$psql_cmd" ]]; then
-                        local psql_args=()
-                        [[ -n "$db_user" ]] && psql_args+=(-U "$db_user")
-                        [[ -n "$db_host" ]] && psql_args+=(-h "$db_host")
-                        [[ -n "$db_port" ]] && psql_args+=(-p "$db_port")
+                        local psql_args=(-U "$db_user" -h "$db_host")
+                        [[ -n "${db_port:-}" ]] && psql_args+=(-p "$db_port")
 
-                        PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d postgres \
-                            -c "DROP DATABASE IF EXISTS \"$ws_db\";" 2>/dev/null && \
-                            success "Base de données '$ws_db' supprimée" || true
+                        if PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d postgres \
+                            -c "DROP DATABASE IF EXISTS \"$ws_db\";" 2>/dev/null; then
+                            success "Base de données '$ws_db' supprimée"
+                        else
+                            warn "Impossible de supprimer la DB '$ws_db'"
+                        fi
                     fi
-                fi
-                ;;
-        esac
+                    ;;
+            esac
+        fi
     fi
 
     # Supprimer le worktree (s'assurer de ne pas être dedans)
@@ -919,7 +927,19 @@ _cleanup_workspace() {
 # ── DESTROY (alias rapide) ──
 
 cmd_destroy() {
-    local branch_name="${1:?Usage: ws destroy <branch-name>}"
+    local branch_name="" keep_db=""
+    for arg in "$@"; do
+        case "$arg" in
+            --keep-db) keep_db="--keep-db" ;;
+            *) branch_name="$arg" ;;
+        esac
+    done
+
+    if [[ -z "$branch_name" ]]; then
+        error "Usage: ws destroy <branch-name> [--keep-db]"
+        exit 1
+    fi
+
     local root
     root="$(find_project_root)"
     local sname
@@ -938,11 +958,12 @@ cmd_destroy() {
     echo -e "${RED}${BOLD}Suppression du workspace '$sname'${NC}"
     echo -e "  Worktree: $wt_path"
     echo -e "  Branche:  $wt_branch"
+    [[ -n "$keep_db" ]] && echo -e "  ${DIM}(base de données conservée)${NC}"
     echo ""
     read -rp "Confirmer ? (y/N): " confirm
     [[ "$confirm" =~ ^[yY]$ ]] || exit 0
 
-    _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root"
+    _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root" "$keep_db"
 }
 
 # ── HELP ──
@@ -957,7 +978,7 @@ cmd_help() {
     echo -e "  ws status                       Affiche tous les workspaces et leur état"
     echo -e "  ws preview [branch]             Ouvre le site dans le navigateur"
     echo -e "  ws finish [branch]              Termine le travail (PR / merge / abandon)"
-    echo -e "  ws destroy <branch>             Supprime le workspace, la DB, et le lien Herd"
+    echo -e "  ws destroy <branch> [--keep-db]  Supprime le workspace et le lien Herd (--keep-db conserve la DB)"
     echo -e "  ws help                         Affiche cette aide"
     echo ""
     echo -e "${BOLD}Exemples:${NC}"
