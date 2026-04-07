@@ -883,11 +883,15 @@ _cleanup_workspace() {
         esac
     fi
 
-    # Supprimer le worktree
+    # Supprimer le worktree (s'assurer de ne pas être dedans)
     cd "$root"
-    git worktree remove "$wt_path" --force 2>/dev/null && \
-        success "Worktree supprimé" || \
-        { rm -rf "$wt_path"; success "Worktree supprimé (force)"; }
+    if git worktree remove "$wt_path" --force 2>/dev/null; then
+        success "Worktree supprimé"
+    else
+        rm -rf "$wt_path"
+        git worktree prune 2>/dev/null || true
+        success "Worktree supprimé (force)"
+    fi
 
     # Supprimer la branche
     if [[ -n "$wt_branch" ]]; then
