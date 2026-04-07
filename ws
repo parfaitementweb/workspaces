@@ -154,8 +154,8 @@ cmd_create() {
     _setup_env "$root" "$sname" "$secure"
     _setup_composer
     _setup_npm
-    _setup_database "$sname"
-    _setup_herd "$sname" "$secure"
+    _setup_database "$sname" "$root"
+    _setup_herd "$sname" "$secure" "$wt_path"
     _setup_vite
     _clear_cache
 
@@ -298,14 +298,18 @@ _setup_npm() {
 
 _setup_database() {
     local sname="$1"
+    local root="${2:-}"
 
     if [[ ! -f ".env" || ! -f "artisan" ]]; then
         return 0
     fi
 
-    # Lire le nom DB du .env et créer une variante
+    # Lire la config DB depuis le .env du projet principal (avant nos modifications)
+    local source_env="${root:+$root/.env}"
+    [[ -z "$source_env" || ! -f "$source_env" ]] && source_env=".env"
+
     local original_db
-    original_db=$(grep "^DB_DATABASE=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    original_db=$(grep "^DB_DATABASE=" "$source_env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
 
     if [[ -z "$original_db" ]]; then
         return 0
@@ -316,18 +320,16 @@ _setup_database() {
     # Mettre à jour le .env avec la nouvelle DB
     sed -i '' "s|^DB_DATABASE=.*|DB_DATABASE=$workspace_db|" .env 2>/dev/null || true
 
-    # Détecter le driver DB
-    local db_connection
+    # Lire les credentials depuis le .env du workspace (déjà copié)
+    local db_connection db_user db_pass db_host db_port
     db_connection=$(grep "^DB_CONNECTION=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    db_user=$(grep "^DB_USERNAME=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    db_pass=$(grep "^DB_PASSWORD=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    db_host=$(grep "^DB_HOST=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    db_port=$(grep "^DB_PORT=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
 
     case "$db_connection" in
         mysql|mariadb)
-            local db_user db_pass db_host db_port
-            db_user=$(grep "^DB_USERNAME=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-            db_pass=$(grep "^DB_PASSWORD=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-            db_host=$(grep "^DB_HOST=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-            db_port=$(grep "^DB_PORT=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-
             if command -v mysql &>/dev/null; then
                 mysql \
                     -u"${db_user:-root}" \
@@ -340,19 +342,36 @@ _setup_database() {
             fi
             ;;
         pgsql)
-            local db_user db_host db_port
-            db_user=$(grep "^DB_USERNAME=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-            db_host=$(grep "^DB_HOST=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-            db_port=$(grep "^DB_PORT=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+            local psql_cmd=""
+            if command -v psql &>/dev/null; then
+                psql_cmd="psql"
+            elif [[ -x "$HOME/Library/Application Support/Herd/bin/psql" ]]; then
+                psql_cmd="$HOME/Library/Application Support/Herd/bin/psql"
+            fi
 
-            if command -v createdb &>/dev/null; then
-                createdb \
-                    ${db_user:+-U "$db_user"} \
-                    ${db_host:+-h "$db_host"} \
-                    ${db_port:+-p "$db_port"} \
-                    "$workspace_db" 2>/dev/null && \
+            if [[ -n "$psql_cmd" ]]; then
+                local psql_args=()
+                [[ -n "$db_user" ]] && psql_args+=(-U "$db_user")
+                [[ -n "$db_host" ]] && psql_args+=(-h "$db_host")
+                [[ -n "$db_port" ]] && psql_args+=(-p "$db_port")
+
+                # Se connecter à la DB source pour créer la nouvelle
+                PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d "$original_db" \
+                    -c "CREATE DATABASE \"$workspace_db\";" 2>/dev/null && \
                     success "Base de données '$workspace_db' créée (PostgreSQL)" || \
                     warn "Impossible de créer la DB — à faire manuellement"
+
+                # Recréer le search_path (schema) si défini
+                local search_path
+                search_path=$(grep "^DB_SEARCH_PATH=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+                if [[ -n "$search_path" ]]; then
+                    PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d "$workspace_db" \
+                        -c "CREATE SCHEMA IF NOT EXISTS \"$search_path\";" 2>/dev/null && \
+                        success "Schema '$search_path' créé" || \
+                        warn "Impossible de créer le schema — à faire manuellement"
+                fi
+            else
+                warn "psql non trouvé — DB PostgreSQL à créer manuellement"
             fi
             ;;
         sqlite)
@@ -369,11 +388,20 @@ _setup_database() {
     php artisan migrate --quiet --no-interaction 2>/dev/null && \
         success "Migrations exécutées" || \
         warn "Migrations échouées — à faire manuellement"
+
+    # Seeder si DatabaseSeeder existe
+    if [[ -f "database/seeders/DatabaseSeeder.php" ]]; then
+        info "Exécution des seeders..."
+        php artisan db:seed --quiet --no-interaction 2>/dev/null && \
+            success "Seeders exécutés" || \
+            warn "Seeders échoués — à faire manuellement"
+    fi
 }
 
 _setup_herd() {
     local sname="$1"
     local secure="${2:-}"
+    local wt_path="${3:-$PWD}"
 
     if ! command -v herd &>/dev/null; then
         warn "Herd non détecté dans le PATH"
@@ -381,7 +409,7 @@ _setup_herd() {
     fi
 
     info "Liaison avec Herd..."
-    herd link "$sname" 2>/dev/null && \
+    (cd "$wt_path" && herd link "$sname") 2>/dev/null && \
         success "Herd link: $sname.test" || \
         { warn "Herd link a échoué — à faire manuellement"; return 0; }
 
@@ -832,13 +860,24 @@ _cleanup_workspace() {
                 fi
                 ;;
             pgsql)
-                if command -v dropdb &>/dev/null && [[ -n "$ws_db" ]]; then
-                    dropdb \
-                        ${db_user:+-U "$db_user"} \
-                        ${db_host:+-h "$db_host"} \
-                        ${db_port:+-p "$db_port"} \
-                        --if-exists "$ws_db" 2>/dev/null && \
-                        success "Base de données '$ws_db' supprimée" || true
+                if [[ -n "$ws_db" ]]; then
+                    local psql_cmd=""
+                    if command -v psql &>/dev/null; then
+                        psql_cmd="psql"
+                    elif [[ -x "$HOME/Library/Application Support/Herd/bin/psql" ]]; then
+                        psql_cmd="$HOME/Library/Application Support/Herd/bin/psql"
+                    fi
+
+                    if [[ -n "$psql_cmd" ]]; then
+                        local psql_args=()
+                        [[ -n "$db_user" ]] && psql_args+=(-U "$db_user")
+                        [[ -n "$db_host" ]] && psql_args+=(-h "$db_host")
+                        [[ -n "$db_port" ]] && psql_args+=(-p "$db_port")
+
+                        PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d postgres \
+                            -c "DROP DATABASE IF EXISTS \"$ws_db\";" 2>/dev/null && \
+                            success "Base de données '$ws_db' supprimée" || true
+                    fi
                 fi
                 ;;
         esac
