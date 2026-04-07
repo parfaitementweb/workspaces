@@ -154,7 +154,7 @@ cmd_create() {
     _setup_env "$root" "$sname" "$secure"
     _setup_composer
     _setup_npm
-    _setup_database "$sname" "$root"
+    _setup_database "$branch_name" "$root"
     _setup_herd "$sname" "$secure" "$wt_path"
     _setup_vite
     _clear_cache
@@ -297,7 +297,7 @@ _setup_npm() {
 }
 
 _setup_database() {
-    local sname="$1"
+    local branch_name="$1"
     local root="${2:-}"
 
     if [[ ! -f ".env" || ! -f "artisan" ]]; then
@@ -315,30 +315,36 @@ _setup_database() {
         return 0
     fi
 
-    local workspace_db="${original_db}_${sname//-/_}"
+    local branch_slug
+    branch_slug="$(slugify "$branch_name")"
+    local workspace_db="${original_db}_${branch_slug//-/_}"
 
     # Mettre à jour le .env avec la nouvelle DB
     sed -i '' "s|^DB_DATABASE=.*|DB_DATABASE=$workspace_db|" .env 2>/dev/null || true
 
-    # Lire les credentials depuis le .env du workspace (déjà copié)
+    # Lire les credentials depuis le .env du workspace, avec defaults Laravel
     local db_connection db_user db_pass db_host db_port
-    db_connection=$(grep "^DB_CONNECTION=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-    db_user=$(grep "^DB_USERNAME=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-    db_pass=$(grep "^DB_PASSWORD=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-    db_host=$(grep "^DB_HOST=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-    db_port=$(grep "^DB_PORT=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    db_connection=$(grep "^DB_CONNECTION=" .env | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
+    db_user=$(grep "^DB_USERNAME=" .env | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
+    db_pass=$(grep "^DB_PASSWORD=" .env | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
+    db_host=$(grep "^DB_HOST=" .env | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
+    db_port=$(grep "^DB_PORT=" .env | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
+    db_user="${db_user:-root}"
+    db_host="${db_host:-127.0.0.1}"
 
-    case "$db_connection" in
+    case "${db_connection:-}" in
         mysql|mariadb)
             if command -v mysql &>/dev/null; then
-                mysql \
-                    -u"${db_user:-root}" \
+                if mysql \
+                    -u"$db_user" \
                     ${db_pass:+-p"$db_pass"} \
-                    ${db_host:+-h"$db_host"} \
+                    -h"$db_host" \
                     ${db_port:+-P"$db_port"} \
-                    -e "CREATE DATABASE IF NOT EXISTS \`$workspace_db\`;" 2>/dev/null && \
-                    success "Base de données '$workspace_db' créée (MySQL)" || \
+                    -e "CREATE DATABASE IF NOT EXISTS \`$workspace_db\`;" 2>/dev/null; then
+                    success "Base de données '$workspace_db' créée (MySQL)"
+                else
                     warn "Impossible de créer la DB — à faire manuellement"
+                fi
             fi
             ;;
         pgsql)
@@ -350,25 +356,27 @@ _setup_database() {
             fi
 
             if [[ -n "$psql_cmd" ]]; then
-                local psql_args=()
-                [[ -n "$db_user" ]] && psql_args+=(-U "$db_user")
-                [[ -n "$db_host" ]] && psql_args+=(-h "$db_host")
-                [[ -n "$db_port" ]] && psql_args+=(-p "$db_port")
+                local psql_args=(-U "$db_user" -h "$db_host")
+                [[ -n "${db_port:-}" ]] && psql_args+=(-p "$db_port")
 
                 # Se connecter à la DB source pour créer la nouvelle
-                PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d "$original_db" \
-                    -c "CREATE DATABASE \"$workspace_db\";" 2>/dev/null && \
-                    success "Base de données '$workspace_db' créée (PostgreSQL)" || \
+                if PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d "$original_db" \
+                    -c "CREATE DATABASE \"$workspace_db\";" 2>/dev/null; then
+                    success "Base de données '$workspace_db' créée (PostgreSQL)"
+                else
                     warn "Impossible de créer la DB — à faire manuellement"
+                fi
 
                 # Recréer le search_path (schema) si défini
-                local search_path
-                search_path=$(grep "^DB_SEARCH_PATH=" .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+                local search_path=""
+                search_path=$(grep "^DB_SEARCH_PATH=" .env | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
                 if [[ -n "$search_path" ]]; then
-                    PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d "$workspace_db" \
-                        -c "CREATE SCHEMA IF NOT EXISTS \"$search_path\";" 2>/dev/null && \
-                        success "Schema '$search_path' créé" || \
+                    if PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d "$workspace_db" \
+                        -c "CREATE SCHEMA IF NOT EXISTS \"$search_path\";" 2>/dev/null; then
+                        success "Schema '$search_path' créé"
+                    else
                         warn "Impossible de créer le schema — à faire manuellement"
+                    fi
                 fi
             else
                 warn "psql non trouvé — DB PostgreSQL à créer manuellement"
@@ -385,16 +393,20 @@ _setup_database() {
 
     # Lancer les migrations
     info "Exécution des migrations..."
-    php artisan migrate --quiet --no-interaction 2>/dev/null && \
-        success "Migrations exécutées" || \
+    if php artisan migrate --quiet --no-interaction 2>/dev/null; then
+        success "Migrations exécutées"
+    else
         warn "Migrations échouées — à faire manuellement"
+    fi
 
     # Seeder si DatabaseSeeder existe
     if [[ -f "database/seeders/DatabaseSeeder.php" ]]; then
         info "Exécution des seeders..."
-        php artisan db:seed --quiet --no-interaction 2>/dev/null && \
-            success "Seeders exécutés" || \
+        if php artisan db:seed --quiet --no-interaction 2>/dev/null; then
+            success "Seeders exécutés"
+        else
             warn "Seeders échoués — à faire manuellement"
+        fi
     fi
 }
 
