@@ -6,10 +6,16 @@ Inspiré par [Polyscope](https://getpolyscope.com/) et [laravel-herd-worktree](h
 
 ## Installation
 
+Cloner le repo puis créer un symlink :
+
 ```bash
-cp ws /usr/local/bin/ws
-chmod +x /usr/local/bin/ws
+git clone git@github.com:parfaitementweb/workspaces.git /path/to/workspaces
+sudo ln -s /path/to/workspaces/ws /usr/local/bin/ws
 ```
+
+Comme c'est un symlink, un `git pull` dans le repo mettra à jour la commande `ws` partout.
+
+> Remplace `/path/to/workspaces` par l'emplacement réel du repo cloné sur ta machine.
 
 ## Prérequis
 
