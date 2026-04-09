@@ -38,18 +38,22 @@ cd ~/Sites/my-project
 ```bash
 ws create feature/auth            # HTTP by default
 ws create feature/auth --secure   # HTTPS (herd secure)
+ws create pr:42                   # check out GitHub PR #42 in a worktree
 ```
 
 Everything is handled automatically:
 - Creates a git worktree in `.worktrees/my-project-feature-auth/`
 - Copies `.env` from the main project
 - Updates `APP_URL`, `SESSION_DOMAIN`, `SANCTUM_STATEFUL_DOMAINS`, `SESSION_SECURE_COOKIE`
+- Assigns a unique `VITE_PORT` (deterministic per branch, avoids `npm run dev` collisions)
 - Creates an isolated database (`myproject_feature_auth`)
 - Runs `composer install` and `npm install`
 - Runs migrations and seeders
 - Links with Herd → `http(s)://my-project-feature-auth.test`
-- Checks Vite config (`host: 'localhost'`, `cors: true`)
+- Patches Vite config (`host: 'localhost'`, `cors: true`, `port: Number(process.env.VITE_PORT) || 5173`)
 - Clears Laravel caches
+
+**PR checkout** (`ws create pr:N`) fetches `pull/N/head` into a local branch `pr-N` via `gh` and creates a worktree on it — ideal for reviewing a PR in a full Laravel environment (isolated DB, Herd link, dependencies).
 
 ### Launch Claude Code in a workspace
 
@@ -104,6 +108,43 @@ ws destroy feature/auth --keep-db    # keeps the database
 ```
 
 Deletes the worktree, local branch, database, Herd link, and SSL certificate if applicable. Use `--keep-db` to keep the database.
+
+## Hooks
+
+Drop executable scripts in `.ws/hooks/` at the repo root to run custom logic on workspace lifecycle events:
+
+| Hook | When it runs |
+|---|---|
+| `pre-create` | Worktree created, before dependencies install |
+| `post-create` | `ws create` finished, everything set up |
+| `pre-destroy` | Before `ws destroy` removes anything |
+| `post-finish` | After `ws finish` (PR / merge / abandon) |
+
+The following variables are exported to hooks:
+
+| Variable | Value |
+|---|---|
+| `WS_EVENT` | Hook name (`post-create`, `pre-destroy`, ...) |
+| `WS_PROJECT` | Main project name |
+| `WS_BRANCH` | Branch name |
+| `WS_SITE` | Slug used for the Herd site / worktree dir |
+| `WS_DIR` | Absolute path to the worktree |
+| `WS_URL` | Full URL (`http(s)://…test`) |
+| `WS_DB` | Workspace database name (if Laravel + DB detected) |
+| `WS_ROOT` | Absolute path to the main repo |
+
+Example `.ws/hooks/post-create`:
+
+```bash
+#!/usr/bin/env bash
+set -e
+cd "$WS_DIR"
+php artisan db:seed --class=DemoSeeder --no-interaction || true
+php artisan horizon:terminate 2>/dev/null || true
+echo "✔ workspace $WS_BRANCH ready at $WS_URL"
+```
+
+Don't forget `chmod +x .ws/hooks/post-create`. Hooks are optional — if a file is missing or not executable, `ws` silently skips it.
 
 ## Naming
 

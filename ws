@@ -117,13 +117,59 @@ site_protocol() {
     fi
 }
 
+# Deterministic Vite port per workspace (5173..6172) based on site slug
+_hash_port() {
+    local name="$1"
+    local hash
+    hash=$(printf '%s' "$name" | cksum | awk '{print $1}')
+    echo $((5173 + hash % 1000))
+}
+
+# Run a project-level hook if present at .ws/hooks/<event>
+# Expected env: WS_ROOT, optionally WS_PROJECT, WS_BRANCH, WS_SITE, WS_DIR, WS_URL, WS_DB
+_run_hook() {
+    local event="$1"
+    local root="$2"
+    local hook="$root/.ws/hooks/$event"
+    if [[ -x "$hook" ]]; then
+        info "Running hook: $event"
+        WS_EVENT="$event" \
+        WS_PROJECT="${WS_PROJECT:-$(basename "$root")}" \
+        WS_BRANCH="${WS_BRANCH:-}" \
+        WS_SITE="${WS_SITE:-}" \
+        WS_DIR="${WS_DIR:-}" \
+        WS_URL="${WS_URL:-}" \
+        WS_DB="${WS_DB:-}" \
+        WS_ROOT="$root" \
+        "$hook" || warn "Hook $event exited with error"
+    fi
+}
+
 # ── CREATE ──
 
 cmd_create() {
-    local branch_name="${1:?Usage: ws create <branch-name>}"
+    local branch_name="${1:?Usage: ws create <branch-name|pr:NUMBER>}"
     local secure="${2:-}"
     local root
     root="$(find_project_root)"
+
+    # PR checkout mode: ws create pr:123 → fetch pull/123/head into pr-123, then use it
+    if [[ "$branch_name" =~ ^pr:([0-9]+)$ ]]; then
+        local pr_num="${BASH_REMATCH[1]}"
+        if ! command -v gh >/dev/null 2>&1; then
+            error "gh CLI is required for PR checkout (install: https://cli.github.com)"
+            exit 1
+        fi
+        info "Fetching PR #${pr_num}..."
+        local head_ref
+        head_ref=$(gh pr view "$pr_num" --json headRefName -q .headRefName 2>/dev/null) \
+            || { error "PR #${pr_num} not found"; exit 1; }
+        git -C "$root" fetch origin "pull/${pr_num}/head:pr-${pr_num}" 2>/dev/null \
+            || { error "Failed to fetch pull/${pr_num}/head"; exit 1; }
+        branch_name="pr-${pr_num}"
+        success "PR #${pr_num} (${head_ref}) fetched as branch ${branch_name}"
+    fi
+
     local sname
     sname="$(site_name "$branch_name")"
     local wt_path
@@ -149,18 +195,31 @@ cmd_create() {
     git worktree add "$wt_path" "$branch_name"
     success "Worktree created: $wt_path"
 
+    # Export hook context (available to pre-create and onwards)
+    local proto
+    proto="$(site_protocol "$sname")"
+    [[ "$secure" == "--secure" ]] && proto="https"
+    export WS_PROJECT="$(basename "$root")"
+    export WS_BRANCH="$branch_name"
+    export WS_SITE="$sname"
+    export WS_DIR="$wt_path"
+    export WS_URL="${proto}://${sname}.test"
+    export WS_ROOT="$root"
+
     # ── Auto-detection and setup ──
     cd "$wt_path"
+    _run_hook "pre-create" "$root"
     _setup_env "$root" "$sname" "$secure"
     _setup_composer
     _setup_npm
     _setup_database "$branch_name" "$root"
+    # WS_DB is set by _setup_database if applicable
     _setup_herd "$sname" "$secure" "$wt_path"
     _setup_vite
     _clear_cache
+    _run_hook "post-create" "$root"
 
     # ── Post-creation summary ──
-    local proto
     proto="$(site_protocol "$sname")"
     local url="${proto}://${sname}.test"
 
@@ -267,6 +326,16 @@ _setup_env() {
         fi
     fi
 
+    # Unique Vite port per workspace (avoids npm run dev collisions)
+    local vite_port
+    vite_port=$(_hash_port "$sname")
+    if grep -q "^VITE_PORT=" .env 2>/dev/null; then
+        sed -i '' "s|^VITE_PORT=.*|VITE_PORT=${vite_port}|" .env 2>/dev/null || true
+    else
+        echo "VITE_PORT=${vite_port}" >> .env
+    fi
+    success "VITE_PORT=${vite_port} (unique per workspace)"
+
     success ".env configured (APP_URL=${proto}://${sname}.test)"
 }
 
@@ -321,6 +390,7 @@ _setup_database() {
 
     # Update .env with the new DB
     sed -i '' "s|^DB_DATABASE=.*|DB_DATABASE=$workspace_db|" .env 2>/dev/null || true
+    export WS_DB="$workspace_db"
 
     # Read credentials from workspace .env, with Laravel defaults
     local db_connection db_user db_pass db_host db_port
@@ -447,14 +517,15 @@ _setup_vite() {
 
     # Check if host and cors are configured
     if ! grep -q "host:" "$vite_config" 2>/dev/null; then
-        info "Adding host: 'localhost' and cors: true to $vite_config..."
+        info "Adding host: 'localhost', cors: true, port: from VITE_PORT to $vite_config..."
         # Inject server config into vite file
         if grep -q "server:" "$vite_config" 2>/dev/null; then
-            # server: already exists, check/add host and cors
+            # server: already exists, check/add host, cors and port
             if ! grep -q "host:" "$vite_config" 2>/dev/null; then
                 sed -i '' "/server:/a\\
 \\            host: 'localhost',\\
-\\            cors: true," "$vite_config" 2>/dev/null || true
+\\            cors: true,\\
+\\            port: Number(process.env.VITE_PORT) || 5173," "$vite_config" 2>/dev/null || true
             fi
         else
             # Add a server block after defineConfig
@@ -462,9 +533,16 @@ _setup_vite() {
 \\        server: {\\
 \\            host: 'localhost',\\
 \\            cors: true,\\
+\\            port: Number(process.env.VITE_PORT) || 5173,\\
 \\        }," "$vite_config" 2>/dev/null || true
         fi
-        success "vite.config: host: 'localhost', cors: true"
+        success "vite.config: host: 'localhost', cors: true, port from VITE_PORT"
+    elif ! grep -q "process.env.VITE_PORT" "$vite_config" 2>/dev/null; then
+        # host already configured but no VITE_PORT wiring — add port line next to host
+        info "Adding port: Number(process.env.VITE_PORT) || 5173 to $vite_config..."
+        sed -i '' "/host: 'localhost'/a\\
+\\            port: Number(process.env.VITE_PORT) || 5173," "$vite_config" 2>/dev/null || true
+        success "vite.config: port wired to VITE_PORT"
     fi
 
     # Kill existing Vite processes that might interfere
@@ -714,6 +792,12 @@ cmd_finish() {
     echo ""
     read -rp "Choice (1-3): " finish_choice
 
+    export WS_PROJECT="$(basename "$root")"
+    export WS_BRANCH="$wt_branch"
+    export WS_SITE="$sname"
+    export WS_DIR="$wt_path"
+    export WS_ROOT="$root"
+
     case "$finish_choice" in
         1) _finish_pr "$sname" "$wt_path" "$wt_branch" "$root" ;;
         2) _finish_merge "$sname" "$wt_path" "$wt_branch" "$root" ;;
@@ -723,6 +807,8 @@ cmd_finish() {
             exit 1
             ;;
     esac
+
+    _run_hook "post-finish" "$root"
 }
 
 _finish_pr() {
@@ -963,6 +1049,13 @@ cmd_destroy() {
     read -rp "Confirm? (y/N): " confirm
     [[ "$confirm" =~ ^[yY]$ ]] || exit 0
 
+    export WS_PROJECT="$(basename "$root")"
+    export WS_BRANCH="$wt_branch"
+    export WS_SITE="$sname"
+    export WS_DIR="$wt_path"
+    export WS_ROOT="$root"
+    _run_hook "pre-destroy" "$root"
+
     _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root" "$keep_db"
 }
 
@@ -973,18 +1066,19 @@ cmd_help() {
     echo -e "${BOLD}ws${NC} v$VERSION — Workspace manager for Laravel + Claude Code"
     echo ""
     echo -e "${BOLD}Usage:${NC}"
-    echo -e "  ws create <branch> [--secure]   Create an isolated workspace (worktree + env + db + herd)"
-    echo -e "  ws run [branch]                 Launch Claude Code in the workspace"
-    echo -e "  ws status                       Show all workspaces and their state"
-    echo -e "  ws preview [branch]             Open the site in the browser"
-    echo -e "  ws finish [branch]              Finish work (PR / merge / abandon)"
-    echo -e "  ws destroy <branch> [--keep-db]  Delete the workspace and Herd link (--keep-db keeps the DB)"
-    echo -e "  ws help                         Show this help"
+    echo -e "  ws create <branch|pr:N> [--secure]  Create a workspace (branch or GitHub PR)"
+    echo -e "  ws run [branch]                     Launch Claude Code in the workspace"
+    echo -e "  ws status                           Show all workspaces and their state"
+    echo -e "  ws preview [branch]                 Open the site in the browser"
+    echo -e "  ws finish [branch]                  Finish work (PR / merge / abandon)"
+    echo -e "  ws destroy <branch> [--keep-db]     Delete the workspace and Herd link"
+    echo -e "  ws help                             Show this help"
     echo ""
     echo -e "${BOLD}Examples:${NC}"
     echo -e "  ${DIM}cd ~/Sites/my-project${NC}"
-    echo -e "  ws create feature/auth               ${DIM}# HTTP by default${NC}"
+    echo -e "  ws create feature/auth                ${DIM}# HTTP by default${NC}"
     echo -e "  ws create feature/auth --secure       ${DIM}# HTTPS with herd secure${NC}"
+    echo -e "  ws create pr:42                       ${DIM}# check out PR #42 in a worktree${NC}"
     echo -e "  ws run feature/auth"
     echo -e "  ws run                                ${DIM}# from the worktree, or interactive choice${NC}"
     echo -e "  ws status"
@@ -995,6 +1089,11 @@ cmd_help() {
     echo -e "${BOLD}Naming:${NC}"
     echo -e "  Herd sites use the format ${CYAN}project-branch.test${NC}"
     echo -e "  E.g.: project ${DIM}my-app${NC} + branch ${DIM}feature/login${NC} → ${CYAN}my-app-feature-login.test${NC}"
+    echo ""
+    echo -e "${BOLD}Hooks:${NC}"
+    echo -e "  Drop executables in ${CYAN}.ws/hooks/${NC} at the repo root to run on lifecycle events:"
+    echo -e "  ${DIM}pre-create, post-create, pre-destroy, post-finish${NC}"
+    echo -e "  Env available to hooks: ${DIM}WS_PROJECT, WS_BRANCH, WS_SITE, WS_DIR, WS_URL, WS_DB, WS_ROOT, WS_EVENT${NC}"
     echo ""
 }
 
