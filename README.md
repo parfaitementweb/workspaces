@@ -27,7 +27,7 @@ Cheat sheet:
 
 | Command | What it does |
 |---|---|
-| `ws create <branch\|pr:N> [--secure] [--fresh] [--open] [--agent <cmd> -- args]` | Create a workspace (HTTPS, empty DB, open agent, other agent) |
+| `ws create <branch\|pr:N> [--from <branch>] [--secure] [--fresh] [--open] [--agent <cmd> -- args]` | Create a workspace (base branch, HTTPS, empty DB, open agent, other agent) |
 | `ws setup [--from <repo>] [--name <site>] [--standalone]` | Provision the current checkout (worktree, Polyscope clone...) |
 | `ws run [branch] [--agent <cmd>] [-- args]` | Launch the agent in the workspace |
 | `ws open [branch] [--agent <cmd>] [-- args]` | Same, in a new terminal tab/window |
@@ -83,12 +83,13 @@ ws create feature/auth            # HTTP by default
 ws create feature/auth --open     # ...and open the agent in a new terminal tab when ready
 ws create feature/auth --secure   # HTTPS (herd secure)
 ws create feature/auth --fresh    # empty DB + migrate + seed instead of cloning the main DB
+ws create feature/auth --from develop   # branch off develop instead of the default branch
 ws create pr:42                   # check out GitHub PR #42 in a worktree
 ws create feature/auth --open --agent codex -- --model o3   # other agent, extra args after --
 ```
 
 Everything is handled automatically:
-- Creates a git worktree in `.worktrees/my-project-feature-auth/`
+- Creates a git worktree in `.worktrees/my-project-feature-auth/`, on a new branch cut from the repo default branch (`origin/HEAD`, i.e. `main`/`master`/`develop`) — whatever the main checkout currently has checked out. Override with `--from <branch|tag|sha>`; a branch that already exists locally is checked out as-is and `--from` is ignored
 - Copies `.env` from the main project
 - Updates `APP_URL`, `SESSION_DOMAIN`, `SANCTUM_STATEFUL_DOMAINS`, `SESSION_SECURE_COOKIE`
 - Assigns a unique `VITE_PORT` (deterministic per branch, avoids `npm run dev` collisions)

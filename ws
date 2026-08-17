@@ -114,6 +114,20 @@ detect_default_branch() {
     echo "$branch"
 }
 
+# Resolve a start point for a new branch: local branch, then origin/<ref>, then any commit-ish
+_resolve_start_point() {
+    local root="$1" ref="$2"
+    if git -C "$root" show-ref --verify --quiet "refs/heads/$ref" 2>/dev/null; then
+        echo "$ref"
+    elif git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$ref" 2>/dev/null; then
+        echo "origin/$ref"
+    elif git -C "$root" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1; then
+        echo "$ref"
+    else
+        return 1
+    fi
+}
+
 # Detect if the Herd site uses HTTPS (checks Herd certificates)
 detect_herd_secure() {
     local sname="$1"
@@ -345,7 +359,7 @@ EOF
 # ── CREATE ──
 
 cmd_create() {
-    local branch_name="" secure="" fresh="" open_after="" agent_flag=""
+    local branch_name="" secure="" fresh="" open_after="" agent_flag="" from_flag=""
     local -a agent_args=()
 
     while (( $# )); do
@@ -353,6 +367,8 @@ cmd_create() {
             --secure)  secure="--secure" ;;
             --fresh)   fresh="--fresh" ;;
             --open)    open_after="1" ;;
+            --from)    from_flag="${2:-}"; shift ;;
+            --from=*)  from_flag="${1#--from=}" ;;
             --agent)   agent_flag="${2:-}"; shift ;;
             --agent=*) agent_flag="${1#--agent=}" ;;
             --)        shift; agent_args=("$@"); break ;;
@@ -365,7 +381,7 @@ cmd_create() {
         shift
     done
 
-    [[ -n "$branch_name" ]] || { error "Usage: ws create <branch-name|pr:NUMBER> [--secure] [--fresh] [--open] [--agent <cmd>]"; exit 1; }
+    [[ -n "$branch_name" ]] || { error "Usage: ws create <branch-name|pr:NUMBER> [--from <branch>] [--secure] [--fresh] [--open] [--agent <cmd>]"; exit 1; }
 
     local root
     root="$(find_project_root)"
@@ -403,10 +419,21 @@ cmd_create() {
         success ".worktrees added to .gitignore"
     fi
 
-    info "Creating worktree on branch '$branch_name'..."
     cd "$root"
-    git worktree add "$wt_path" -b "$branch_name" 2>/dev/null || \
-    git worktree add "$wt_path" "$branch_name"
+    if git -C "$root" show-ref --verify --quiet "refs/heads/$branch_name" 2>/dev/null; then
+        [[ -n "$from_flag" ]] && warn "Branch '$branch_name' already exists — --from '$from_flag' ignored"
+        info "Creating worktree on existing branch '$branch_name'..."
+        git worktree add "$wt_path" "$branch_name" \
+            || { error "Failed to create worktree for branch '$branch_name'"; exit 1; }
+    else
+        local start_ref start_point
+        start_ref="${from_flag:-$(detect_default_branch)}"
+        start_point="$(_resolve_start_point "$root" "$start_ref")" \
+            || { error "Start point '$start_ref' not found (neither local branch, origin branch, nor commit)"; exit 1; }
+        info "Creating worktree on branch '$branch_name' from '$start_point'..."
+        git worktree add "$wt_path" -b "$branch_name" "$start_point" \
+            || { error "Failed to create worktree for branch '$branch_name' from '$start_point'"; exit 1; }
+    fi
     success "Worktree created: $wt_path"
 
     _provision "$root" "$branch_name" "$sname" "$wt_path" "$secure" "$fresh"
@@ -1539,6 +1566,7 @@ cmd_help() {
     echo ""
     echo -e "${BOLD}Usage:${NC}"
     echo -e "  ws create <branch|pr:N> [options]   Create a workspace (branch or GitHub PR)"
+    echo -e "      --from <branch>                 Branch to start from (default: repo default branch)"
     echo -e "      --secure                        HTTPS via herd secure"
     echo -e "      --fresh                         Empty DB + migrate + seed (default: clone main DB)"
     echo -e "      --open                          Open the agent in a new terminal tab when ready"
@@ -1558,6 +1586,7 @@ cmd_help() {
     echo -e "  ${DIM}cd ~/Sites/my-project${NC}"
     echo -e "  ws create feature/auth --open         ${DIM}# workspace + new tab running claude${NC}"
     echo -e "  ws create feature/auth --secure       ${DIM}# HTTPS with herd secure${NC}"
+    echo -e "  ws create feature/auth --from develop ${DIM}# branch off develop instead of main${NC}"
     echo -e "  ws create pr:42                       ${DIM}# check out PR #42 in a worktree${NC}"
     echo -e "  ws run feature/auth -- --resume       ${DIM}# pass args to the agent${NC}"
     echo -e "  ws open feature/auth --agent codex"
