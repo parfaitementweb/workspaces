@@ -6,6 +6,37 @@ Goal: from any project, run one command and get a fresh, fully working copy of t
 
 Inspired by [Polyscope](https://getpolyscope.com/) and [laravel-herd-worktree](https://github.com/harris21/laravel-herd-worktree), with no third-party app dependency. `ws` is the Laravel-aware plumbing; it also plugs into Polyscope and Claude Code's native `--worktree` (see [Integrations](#integrations)).
 
+## Quick usage
+
+```bash
+cd ~/Sites/my-project
+
+ws create feat/auth --open        # workspace + new terminal tab running the agent   (~30 s)
+ws create pr:42                   # review a GitHub PR in a full isolated environment
+ws status                         # list workspaces, dirty flag, DB / Herd state, URLs
+ws open feat/auth                 # (re)open the agent in a new tab
+ws run feat/auth -- --resume      # launch the agent here, pass args through
+ws preview feat/auth              # open http(s)://my-project-feat-auth.test
+ws finish feat/auth               # PR / merge / abandon, then cleanup
+ws destroy feat/auth              # remove worktree, DB, Herd link, branch
+```
+
+Inside a Claude Code session: `/workspace feat/auth` — same as `ws create feat/auth --open`.
+
+Cheat sheet:
+
+| Command | What it does |
+|---|---|
+| `ws create <branch\|pr:N> [--secure] [--fresh] [--open] [--agent <cmd> -- args]` | Create a workspace (HTTPS, empty DB, open agent, other agent) |
+| `ws setup [--from <repo>] [--name <site>] [--standalone]` | Provision the current checkout (worktree, Polyscope clone...) |
+| `ws run [branch] [--agent <cmd>] [-- args]` | Launch the agent in the workspace |
+| `ws open [branch] [--agent <cmd>] [-- args]` | Same, in a new terminal tab/window |
+| `ws status` | Overview of all workspaces |
+| `ws preview [branch]` | Open the site in the browser |
+| `ws finish [branch]` | Guided PR / merge / abandon |
+| `ws destroy <branch> [--keep-db] [--yes]` | Delete everything |
+| `ws hook create\|remove` | Adapter for Claude Code `WorktreeCreate` / `WorktreeRemove` hooks |
+
 ## Installation
 
 Clone the repo and create a symlink:
