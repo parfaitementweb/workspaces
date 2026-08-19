@@ -6,7 +6,7 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
 MAX_LABEL_LEN=60
@@ -221,6 +221,144 @@ _get_env_var() {
     grep "^${var}=" "$file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true
 }
 
+_psql_cmd() {
+    if command -v psql &>/dev/null; then
+        echo "psql"
+    elif [[ -x "$HOME/Library/Application Support/Herd/bin/psql" ]]; then
+        echo "$HOME/Library/Application Support/Herd/bin/psql"
+    else
+        return 1
+    fi
+}
+
+_db_create() {
+    local conn="$1" name="$2" user="${3:-}" pass="${4:-}" host="${5:-}" port="${6:-}" search_path="${7:-}"
+    user="${user:-root}"
+    host="${host:-127.0.0.1}"
+
+    case "$conn" in
+        mysql|mariadb)
+            command -v mysql &>/dev/null || return 1
+            mysql -u"$user" ${pass:+-p"$pass"} -h"$host" ${port:+-P"$port"} \
+                -e "CREATE DATABASE IF NOT EXISTS \`$name\`;" 2>/dev/null || return 1
+            ;;
+        pgsql)
+            local psql_cmd
+            psql_cmd="$(_psql_cmd)" || return 1
+            local -a psql_args=(-q -U "$user" -h "$host")
+            [[ -n "$port" ]] && psql_args+=(-p "$port")
+
+            PGPASSWORD="$pass" "$psql_cmd" "${psql_args[@]}" -d postgres \
+                -c "CREATE DATABASE \"$name\";" 2>/dev/null \
+            || PGPASSWORD="$pass" "$psql_cmd" "${psql_args[@]}" -d postgres -tAc \
+                "SELECT 1 FROM pg_database WHERE datname='$name';" 2>/dev/null | grep -q 1 \
+            || return 1
+
+            if [[ -n "$search_path" && "$search_path" != "public" ]]; then
+                PGPASSWORD="$pass" "$psql_cmd" "${psql_args[@]}" -d "$name" \
+                    -c "CREATE SCHEMA IF NOT EXISTS \"$search_path\";" 2>/dev/null || return 1
+            fi
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_db_drop() {
+    local conn="$1" name="$2" user="${3:-}" pass="${4:-}" host="${5:-}" port="${6:-}"
+    user="${user:-root}"
+    host="${host:-127.0.0.1}"
+
+    case "$conn" in
+        mysql|mariadb)
+            command -v mysql &>/dev/null || return 1
+            mysql -u"$user" ${pass:+-p"$pass"} -h"$host" ${port:+-P"$port"} \
+                -e "DROP DATABASE IF EXISTS \`$name\`;" 2>/dev/null || return 1
+            ;;
+        pgsql)
+            local psql_cmd
+            psql_cmd="$(_psql_cmd)" || return 1
+            local -a psql_args=(-q -U "$user" -h "$host")
+            [[ -n "$port" ]] && psql_args+=(-p "$port")
+
+            PGPASSWORD="$pass" "$psql_cmd" "${psql_args[@]}" -d postgres \
+                -c "DROP DATABASE IF EXISTS \"$name\" WITH (FORCE);" 2>/dev/null \
+            || PGPASSWORD="$pass" "$psql_cmd" "${psql_args[@]}" -d postgres \
+                -c "DROP DATABASE IF EXISTS \"$name\";" 2>/dev/null \
+            || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Read a <env name="VAR" value="…"/> entry from a PHPUnit config file
+_get_phpunit_env() {
+    local file="$1" var="$2"
+    sed -n "s|.*<env[[:space:]]\{1,\}name=\"${var}\"[[:space:]]\{1,\}value=\"\([^\"]*\)\".*|\1|p" "$file" 2>/dev/null | head -1 || true
+}
+
+_set_phpunit_env() {
+    local file="$1" var="$2" value="$3"
+    sed -i '' "s|\(<env[[:space:]]\{1,\}name=\"${var}\"[[:space:]]\{1,\}value=\)\"[^\"]*\"|\1\"${value}\"|" "$file" 2>/dev/null || true
+}
+
+_phpunit_file() {
+    local dir="${1:-.}" f
+    for f in "$dir/phpunit.xml" "$dir/phpunit.xml.dist"; do
+        [[ -f "$f" ]] && { echo "$f"; return 0; }
+    done
+    return 1
+}
+
+# Test database name declared by a project (PHPUnit config wins over .env.testing)
+_detect_test_db() {
+    local dir="${1:-.}" f v
+    for f in "$dir/phpunit.xml" "$dir/phpunit.xml.dist"; do
+        if [[ -f "$f" ]]; then
+            v="$(_get_phpunit_env "$f" DB_DATABASE)"
+            if [[ -n "$v" ]]; then
+                [[ "$v" != ":memory:" ]] && echo "$v"
+                return 0
+            fi
+        fi
+    done
+    if [[ -f "$dir/.env.testing" ]]; then
+        v="$(_get_env_var "$dir/.env.testing" DB_DATABASE)"
+        [[ -n "$v" && "$v" != ":memory:" ]] && echo "$v"
+    fi
+    return 0
+}
+
+# Value used by the test suite: PHPUnit config, then .env.testing, then .env
+_test_env_value() {
+    local dir="${1:-.}" var="$2" f v
+    for f in "$dir/phpunit.xml" "$dir/phpunit.xml.dist"; do
+        if [[ -f "$f" ]]; then
+            v="$(_get_phpunit_env "$f" "$var")"
+            [[ -n "$v" ]] && { echo "$v"; return 0; }
+        fi
+    done
+    for f in "$dir/.env.testing" "$dir/.env"; do
+        if [[ -f "$f" ]]; then
+            v="$(_get_env_var "$f" "$var")"
+            [[ -n "$v" ]] && { echo "$v"; return 0; }
+        fi
+    done
+    return 0
+}
+
+# Workspace-scoped name derived from the project's test database
+_workspace_test_db_name() {
+    local test_db="$1" branch_name="$2"
+    local branch_slug name
+    branch_slug="$(slugify "$branch_name")"
+    name="$(_truncate_label "${test_db}_${branch_slug//-/_}" 63)"
+    echo "${name//-/_}"
+}
+
 # Copy-on-write directory copy (APFS clonefile). Falls back to a regular copy.
 _cow_copy() {
     local src="$1" dst="$2"
@@ -229,7 +367,7 @@ _cow_copy() {
 }
 
 # Run a project-level hook if present at .ws/hooks/<event>
-# Expected env: WS_ROOT, optionally WS_PROJECT, WS_BRANCH, WS_SITE, WS_DIR, WS_URL, WS_DB
+# Expected env: WS_ROOT, optionally WS_PROJECT, WS_BRANCH, WS_SITE, WS_DIR, WS_URL, WS_DB, WS_TEST_DB
 _run_hook() {
     local event="$1"
     local root="$2"
@@ -244,6 +382,7 @@ _run_hook() {
         WS_DIR="${WS_DIR:-}" \
         WS_URL="${WS_URL:-}" \
         WS_DB="${WS_DB:-}" \
+        WS_TEST_DB="${WS_TEST_DB:-}" \
         WS_ROOT="$root" \
         "$hook" || warn "Hook $event exited with error"
     fi
@@ -542,6 +681,7 @@ _provision() {
     _setup_composer "$root"
     _setup_npm "$root"
     _setup_database "$branch_name" "$root" "$fresh"
+    _setup_test_database "$branch_name" "$root"
     _setup_storage "$root"
     _setup_herd "$sname" "$secure" "$wt_path" "$root"
     _setup_vite
@@ -569,6 +709,10 @@ _print_summary() {
         ws_db="$(_get_env_var "$wt_path/.env" DB_DATABASE)"
         [[ -n "$ws_db" ]] && echo -e "  ${BOLD}Database${NC}  ${ws_db}"
     fi
+
+    local ws_test_db
+    ws_test_db="$(_detect_test_db "$wt_path")"
+    [[ -n "$ws_test_db" ]] && echo -e "  ${BOLD}Test DB${NC}   ${ws_test_db}"
 
     echo ""
     echo -e "  ${DIM}Get started:${NC}          cd ${wt_path}"
@@ -897,6 +1041,67 @@ _setup_database() {
             warn "Seeders failed — do it manually"
         fi
     fi
+}
+
+_setup_test_database() {
+    local branch_name="$1"
+    local root="${2:-}"
+
+    [[ -f "artisan" ]] || return 0
+
+    # .env.testing is gitignored, so a fresh worktree never gets one
+    if [[ -n "$root" && -f "$root/.env.testing" && ! -f ".env.testing" ]]; then
+        cp "$root/.env.testing" .env.testing
+        success ".env.testing copied from main project"
+    fi
+
+    # Read the name from the main project so re-provisioning stays idempotent
+    local test_db=""
+    [[ -n "$root" ]] && test_db="$(_detect_test_db "$root")"
+    [[ -n "$test_db" ]] || test_db="$(_detect_test_db .)"
+    [[ -n "$test_db" ]] || return 0
+
+    local db_connection
+    db_connection="$(_test_env_value . DB_CONNECTION)"
+    case "${db_connection:-}" in
+        mysql|mariadb|pgsql) ;;
+        # SQLite test files already live inside the worktree
+        *) return 0 ;;
+    esac
+
+    local workspace_test_db
+    workspace_test_db="$(_workspace_test_db_name "$test_db" "$branch_name")"
+    [[ "$workspace_test_db" != "$test_db" ]] || return 0
+
+    local db_user db_pass db_host db_port search_path
+    db_user="$(_test_env_value . DB_USERNAME)"
+    db_pass="$(_test_env_value . DB_PASSWORD)"
+    db_host="$(_test_env_value . DB_HOST)"
+    db_port="$(_test_env_value . DB_PORT)"
+    search_path="$(_test_env_value . DB_SEARCH_PATH)"
+
+    if _db_create "$db_connection" "$workspace_test_db" "$db_user" "$db_pass" "$db_host" "$db_port" "$search_path"; then
+        success "Test database '$workspace_test_db' created"
+    else
+        warn "Could not create test database '$workspace_test_db' — do it manually"
+    fi
+
+    local phpunit_file
+    if phpunit_file="$(_phpunit_file .)"; then
+        _set_phpunit_env "$phpunit_file" DB_DATABASE "$workspace_test_db"
+        # PHPUnit env entries win over .env.testing, so the tracked file must be
+        # patched; skip-worktree keeps that edit out of every diff and commit
+        if git ls-files --error-unmatch "$phpunit_file" &>/dev/null; then
+            git update-index --skip-worktree "$phpunit_file" 2>/dev/null || true
+        fi
+        success "$(basename "$phpunit_file") → $workspace_test_db"
+    fi
+
+    if [[ -f ".env.testing" ]]; then
+        _set_env_var .env.testing DB_DATABASE "$workspace_test_db"
+    fi
+
+    export WS_TEST_DB="$workspace_test_db"
 }
 
 # Uploads (storage/app) cloned via CoW + public/storage symlink
@@ -1344,6 +1549,38 @@ _finish_abandon() {
 
 # ── CLEANUP (shared) ──
 
+_drop_test_database() {
+    local wt_path="$1" root="${2:-}"
+
+    local ws_test_db main_test_db=""
+    ws_test_db="$(_detect_test_db "$wt_path")"
+    [[ -n "$root" ]] && main_test_db="$(_detect_test_db "$root")"
+    [[ -n "$ws_test_db" ]] || return 0
+
+    if [[ "$ws_test_db" == "$main_test_db" ]]; then
+        warn "Workspace uses the main test database '$ws_test_db' — not dropped"
+        return 0
+    fi
+
+    local test_conn test_user test_pass test_host test_port
+    test_conn="$(_test_env_value "$wt_path" DB_CONNECTION)"
+    case "${test_conn:-}" in
+        mysql|mariadb|pgsql) ;;
+        *) return 0 ;;
+    esac
+
+    test_user="$(_test_env_value "$wt_path" DB_USERNAME)"
+    test_pass="$(_test_env_value "$wt_path" DB_PASSWORD)"
+    test_host="$(_test_env_value "$wt_path" DB_HOST)"
+    test_port="$(_test_env_value "$wt_path" DB_PORT)"
+
+    if _db_drop "$test_conn" "$ws_test_db" "$test_user" "$test_pass" "$test_host" "$test_port"; then
+        success "Test database '$ws_test_db' dropped"
+    else
+        warn "Could not drop test database '$ws_test_db'"
+    fi
+}
+
 _cleanup_workspace() {
     local sname="$1" wt_path="$2" wt_branch="$3" root="$4" keep_db="${5:-}"
 
@@ -1386,46 +1623,21 @@ _cleanup_workspace() {
 
         if [[ -n "$ws_db" && "$ws_db" != "$main_db" ]]; then
             case "${db_connection:-}" in
-                mysql|mariadb)
-                    if command -v mysql &>/dev/null; then
-                        if mysql \
-                            -u"$db_user" \
-                            ${db_pass:+-p"$db_pass"} \
-                            -h"$db_host" \
-                            ${db_port:+-P"$db_port"} \
-                            -e "DROP DATABASE IF EXISTS \`$ws_db\`;" 2>/dev/null; then
-                            success "Database '$ws_db' dropped"
-                        else
-                            warn "Could not drop database '$ws_db'"
-                        fi
-                    fi
-                    ;;
-                pgsql)
-                    local psql_cmd=""
-                    if command -v psql &>/dev/null; then
-                        psql_cmd="psql"
-                    elif [[ -x "$HOME/Library/Application Support/Herd/bin/psql" ]]; then
-                        psql_cmd="$HOME/Library/Application Support/Herd/bin/psql"
-                    fi
-
-                    if [[ -n "$psql_cmd" ]]; then
-                        local psql_args=(-q -U "$db_user" -h "$db_host")
-                        [[ -n "${db_port:-}" ]] && psql_args+=(-p "$db_port")
-
-                        if PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d postgres \
-                            -c "DROP DATABASE IF EXISTS \"$ws_db\" WITH (FORCE);" 2>/dev/null \
-                        || PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d postgres \
-                            -c "DROP DATABASE IF EXISTS \"$ws_db\";" 2>/dev/null; then
-                            success "Database '$ws_db' dropped"
-                        else
-                            warn "Could not drop database '$ws_db'"
-                        fi
+                mysql|mariadb|pgsql)
+                    if _db_drop "$db_connection" "$ws_db" "$db_user" "$db_pass" "$db_host" "$db_port"; then
+                        success "Database '$ws_db' dropped"
+                    else
+                        warn "Could not drop database '$ws_db'"
                     fi
                     ;;
             esac
         elif [[ -n "$ws_db" ]]; then
             warn "Workspace uses the main database '$ws_db' — not dropped"
         fi
+    fi
+
+    if [[ "$keep_db" != "--keep-db" ]]; then
+        _drop_test_database "$wt_path" "$root"
     fi
 
     cd "$root"

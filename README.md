@@ -96,6 +96,7 @@ Everything is handled automatically:
 - Namespaces shared services: `CACHE_PREFIX` / `REDIS_PREFIX` (when Redis or Memcached is used), `HORIZON_PREFIX`, `SCOUT_PREFIX`
 - Clones `vendor/` and `node_modules/` from the main project with copy-on-write, then syncs only if the lockfile differs
 - Clones the database (`myproject_feature_auth`) from the main one — PostgreSQL `TEMPLATE`, `mysqldump`, or SQLite file copy — then runs migrations. `--fresh` creates an empty DB and runs migrations + seeders instead
+- Isolates the test database (`test_myproject_feature_auth`): copies `.env.testing`, creates an empty DB, and points `phpunit.xml` at it so suites can run in parallel with the main repo without deadlocking
 - Clones `storage/app` (uploads) and runs `storage:link`
 - Copies `.claude/settings.local.json` and `CLAUDE.local.md` so agent permissions carry over
 - Links with Herd → `http(s)://my-project-feature-auth.test`
@@ -237,6 +238,7 @@ The following variables are exported to hooks:
 | `WS_DIR` | Absolute path to the worktree |
 | `WS_URL` | Full URL (`http(s)://…test`) |
 | `WS_DB` | Workspace database name (if Laravel + DB detected) |
+| `WS_TEST_DB` | Workspace test database name (if a test DB was detected) |
 | `WS_ROOT` | Absolute path to the main repo |
 
 Example `.ws/hooks/post-create`:
@@ -307,6 +309,7 @@ my-project/
 |---|---|
 | `APP_URL` | `http(s)://project-branch.test` |
 | `DB_DATABASE` | `original_db_branch_slug` |
+| `DB_DATABASE` (testing) | `original_test_db_branch_slug`, written to `.env.testing` and `phpunit.xml` |
 | `SESSION_DOMAIN` | `project-branch.test` (`.project-branch.test` with subdomains) |
 | `SANCTUM_STATEFUL_DOMAINS` | Domain + subdomains appended (if Sanctum detected) |
 | `SESSION_SECURE_COOKIE` | `true` if --secure, `false` otherwise |
@@ -325,6 +328,11 @@ The worktree domain is not in `SANCTUM_STATEFUL_DOMAINS`. Normally configured au
 
 ### Cookies rejected
 `SESSION_DOMAIN` doesn't match the Herd domain. Check the worktree `.env`.
+
+### Tests deadlock or fail randomly
+Two suites are sharing one database. `ws` isolates the test DB per workspace, but only for MySQL/MariaDB/PostgreSQL and only when the name is declared in `phpunit.xml`, `phpunit.xml.dist`, or `.env.testing`. A connection defined directly in `config/database.php` is not detected — run `ws setup` in the worktree and check `Test DB` in the summary.
+
+`phpunit.xml` is tracked by git, so `ws` patches it in the worktree and flags it `--skip-worktree`: the change never shows up in `git status`, diffs, or commits. If an upstream change to `phpunit.xml` later blocks a pull or checkout in that worktree, lift the flag with `git update-index --no-skip-worktree phpunit.xml`.
 
 ### Blank page / CORS errors
 Check that `vite.config.js` has `host: 'localhost'` and `cors: true`. Kill existing Vite processes: `pkill -f "node.*vite"`.
