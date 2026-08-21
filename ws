@@ -128,6 +128,20 @@ _resolve_start_point() {
     fi
 }
 
+# The base branch of a workspace is stored in git config so `ws finish` can
+# target the branch the work actually started from, not whatever is checked out.
+_set_ws_base() {
+    local root="$1" branch="$2" base="$3"
+    git -C "$root" config "branch.${branch}.ws-base" "$base"
+}
+
+_get_ws_base() {
+    local root="$1" branch="$2"
+    local base
+    base="$(git -C "$root" config --get "branch.${branch}.ws-base" 2>/dev/null)"
+    [[ -n "$base" ]] && echo "$base" || detect_default_branch
+}
+
 # Detect if the Herd site uses HTTPS (checks Herd certificates)
 detect_herd_secure() {
     local sname="$1"
@@ -572,6 +586,10 @@ cmd_create() {
         info "Creating worktree on branch '$branch_name' from '$start_point'..."
         git worktree add "$wt_path" -b "$branch_name" "$start_point" \
             || { error "Failed to create worktree for branch '$branch_name' from '$start_point'"; exit 1; }
+        if git -C "$root" show-ref --verify --quiet "refs/heads/$start_ref" 2>/dev/null \
+           || git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$start_ref" 2>/dev/null; then
+            _set_ws_base "$root" "$branch_name" "$start_ref"
+        fi
     fi
     success "Worktree created: $wt_path"
 
@@ -1406,20 +1424,39 @@ cmd_finish() {
     local root
     root="$(find_project_root)"
 
+    local branch_arg="" into_flag=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --into)    into_flag="${2:-}"; shift ;;
+            --into=*)  into_flag="${1#--into=}" ;;
+            -*)        error "Unknown option: $1"; exit 1 ;;
+            *)         branch_arg="$1" ;;
+        esac
+        shift
+    done
+
     local wt_path sname wt_branch
-    wt_path="$(_select_workspace "${1:-}" "Which workspace to finish?")"
+    wt_path="$(_select_workspace "$branch_arg" "Which workspace to finish?")"
     sname="$(basename "$wt_path")"
 
     wt_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
+
+    local base_branch
+    base_branch="${into_flag:-$(_get_ws_base "$root" "$wt_branch")}"
+    if ! git -C "$root" show-ref --verify --quiet "refs/heads/$base_branch" 2>/dev/null \
+       && ! git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$base_branch" 2>/dev/null; then
+        error "Base branch '$base_branch' not found."
+        exit 1
+    fi
 
     if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
         warn "Uncommitted changes in '$sname'."
     fi
 
-    header "Finish workspace '$sname' ($wt_branch)"
+    header "Finish workspace '$sname' ($wt_branch → $base_branch)"
     echo ""
-    echo -e "  ${CYAN}1)${NC} Create a PR from the worktree ${DIM}(recommended)${NC}"
-    echo -e "  ${CYAN}2)${NC} Merge into current branch"
+    echo -e "  ${CYAN}1)${NC} Create a PR against '$base_branch' ${DIM}(recommended)${NC}"
+    echo -e "  ${CYAN}2)${NC} Merge locally into '$base_branch'"
     echo -e "  ${CYAN}3)${NC} Abandon changes"
     echo ""
     read -rp "Choice (1-3): " finish_choice
@@ -1429,10 +1466,11 @@ cmd_finish() {
     export WS_SITE="$sname"
     export WS_DIR="$wt_path"
     export WS_ROOT="$root"
+    export WS_BASE="$base_branch"
 
     case "$finish_choice" in
-        1) _finish_pr "$sname" "$wt_path" "$wt_branch" "$root" ;;
-        2) _finish_merge "$sname" "$wt_path" "$wt_branch" "$root" ;;
+        1) _finish_pr "$sname" "$wt_path" "$wt_branch" "$root" "$base_branch" ;;
+        2) _finish_merge "$sname" "$wt_path" "$wt_branch" "$root" "$base_branch" ;;
         3) _finish_abandon "$sname" "$wt_path" "$wt_branch" "$root" ;;
         *)
             error "Invalid choice."
@@ -1444,7 +1482,7 @@ cmd_finish() {
 }
 
 _finish_pr() {
-    local sname="$1" wt_path="$2" wt_branch="$3" root="$4"
+    local sname="$1" wt_path="$2" wt_branch="$3" root="$4" base_branch="$5"
 
     cd "$wt_path"
 
@@ -1462,9 +1500,6 @@ _finish_pr() {
         { error "Push failed."; exit 1; }
 
     if command -v gh &>/dev/null; then
-        local default_branch
-        default_branch="$(detect_default_branch)"
-
         echo ""
         read -rp "PR title: " pr_title
 
@@ -1477,11 +1512,11 @@ _finish_pr() {
 
         local pr_body=""
         case "$desc_choice" in
-            2) pr_body=$(git log "$default_branch..$wt_branch" --pretty=format:"- %s" 2>/dev/null) ;;
+            2) pr_body=$(git log "$base_branch..$wt_branch" --pretty=format:"- %s" 2>/dev/null) ;;
             3) pr_body="" ;;
         esac
 
-        gh pr create --base "$default_branch" --title "$pr_title" --body "$pr_body" 2>/dev/null && \
+        gh pr create --base "$base_branch" --title "$pr_title" --body "$pr_body" 2>/dev/null && \
             success "PR created!" || \
             warn "PR creation failed — create it manually on GitHub"
     else
@@ -1498,7 +1533,7 @@ _finish_pr() {
 }
 
 _finish_merge() {
-    local sname="$1" wt_path="$2" wt_branch="$3" root="$4"
+    local sname="$1" wt_path="$2" wt_branch="$3" root="$4" base_branch="$5"
 
     if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
         warn "There are uncommitted changes in '$sname'."
@@ -1513,18 +1548,28 @@ _finish_merge() {
         fi
     fi
 
-    local target_branch default_branch
-    target_branch="$(git -C "$root" branch --show-current 2>/dev/null)"
+    local current_branch default_branch
+    current_branch="$(git -C "$root" branch --show-current 2>/dev/null)"
     default_branch="$(detect_default_branch)"
-    if [[ "$target_branch" == "$default_branch" ]]; then
-        warn "The main checkout is on '$default_branch' — this will merge directly into it."
+    if [[ "$base_branch" == "$default_branch" ]]; then
+        warn "This will merge directly into '$default_branch'."
         read -rp "Continue? (y/N): " confirm_main
         [[ "$confirm_main" =~ ^[yY]$ ]] || exit 0
     fi
 
-    header "Merging '$wt_branch' into '$target_branch'"
-
     cd "$root"
+    if [[ "$current_branch" != "$base_branch" ]]; then
+        if [[ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+            error "The main checkout ('$current_branch') has uncommitted changes — commit or stash them before switching to '$base_branch'."
+            exit 1
+        fi
+        info "Switching main checkout from '$current_branch' to '$base_branch'..."
+        git checkout "$base_branch" 2>/dev/null \
+            || { error "Failed to check out '$base_branch'."; exit 1; }
+    fi
+
+    header "Merging '$wt_branch' into '$base_branch'"
+
     git merge "$wt_branch" --no-commit --no-ff && \
         success "Merge successful (not committed — check with git status)" || \
         { error "Conflicts detected — resolve them manually."; exit 1; }
@@ -1790,7 +1835,8 @@ cmd_help() {
     echo -e "  ws open [branch] [--agent <cmd>] [-- args]  Same, in a new terminal tab/window"
     echo -e "  ws status                           Show all workspaces and their state"
     echo -e "  ws preview [branch]                 Open the site in the browser"
-    echo -e "  ws finish [branch]                  Finish work (PR / merge / abandon)"
+    echo -e "  ws finish [branch] [--into <branch>] Finish work (PR / merge / abandon)"
+    echo -e "      --into <branch>                 Target branch (default: the branch the workspace was created from)"
     echo -e "  ws destroy <branch> [--keep-db] [-y] Delete the workspace and Herd link"
     echo -e "  ws hook <create|remove>             Claude Code WorktreeCreate/WorktreeRemove adapter"
     echo -e "  ws help                             Show this help"
@@ -1805,6 +1851,7 @@ cmd_help() {
     echo -e "  ws open feature/auth --agent codex"
     echo -e "  ws status"
     echo -e "  ws finish                             ${DIM}# guided workflow: PR, merge, or abandon${NC}"
+    echo -e "  ws finish feature/auth --into develop ${DIM}# target develop instead of the recorded base${NC}"
     echo -e "  ws destroy feature/auth"
     echo ""
     echo -e "${BOLD}Speed:${NC}"

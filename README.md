@@ -33,7 +33,7 @@ Cheat sheet:
 | `ws open [branch] [--agent <cmd>] [-- args]` | Same, in a new terminal tab/window |
 | `ws status` | Overview of all workspaces |
 | `ws preview [branch]` | Open the site in the browser |
-| `ws finish [branch]` | Guided PR / merge / abandon |
+| `ws finish [branch] [--into <branch>]` | Guided PR / merge / abandon against the base branch |
 | `ws destroy <branch> [--keep-db] [--yes]` | Delete everything |
 | `ws hook create\|remove` | Adapter for Claude Code `WorktreeCreate` / `WorktreeRemove` hooks |
 
@@ -160,14 +160,17 @@ Automatically detects whether the site is HTTP or HTTPS.
 ### Finish work
 
 ```bash
-ws finish                  # guided workflow
-ws finish feature/auth     # specific workspace
+ws finish                            # guided workflow
+ws finish feature/auth               # specific workspace
+ws finish feature/auth --into develop  # override the target branch
 ```
 
 Three options:
-1. **Create a PR** — commit, push, `gh pr create` (recommended)
-2. **Merge locally** — `git merge --no-commit --no-ff` for review
+1. **Create a PR** — commit, push, `gh pr create` against the base branch (recommended)
+2. **Merge locally** — checks out the base branch in the main checkout, then `git merge --no-commit --no-ff` for review
 3. **Abandon** — deletes everything
+
+The base branch is the one the workspace was created from (`--from`, or the repo default branch). It is recorded at creation time (`git config branch.<name>.ws-base`), so it does not depend on what happens to be checked out in the main repo later. Use `--into` to target another branch.
 
 ### Delete a workspace
 
@@ -240,6 +243,7 @@ The following variables are exported to hooks:
 | `WS_DB` | Workspace database name (if Laravel + DB detected) |
 | `WS_TEST_DB` | Workspace test database name (if a test DB was detected) |
 | `WS_ROOT` | Absolute path to the main repo |
+| `WS_BASE` | Base branch targeted by `ws finish` (`post-finish` only) |
 
 Example `.ws/hooks/post-create`:
 
