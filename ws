@@ -719,6 +719,7 @@ _print_summary() {
     echo -e "  ${DIM}Launch agent here:${NC}    ws run"
     echo -e "  ${DIM}Launch in new tab:${NC}    ws open ${branch_name}"
     echo -e "  ${DIM}Open in browser:${NC}      ws preview"
+    echo -e "  ${DIM}When done:${NC}            ws finish ${branch_name}  ${DIM}# PR / merge / abandon, then cleanup${NC}"
     echo ""
 }
 
