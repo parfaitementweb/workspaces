@@ -1570,9 +1570,9 @@ _finish_merge() {
 
     header "Merging '$wt_branch' into '$base_branch'"
 
-    git merge "$wt_branch" --no-commit --no-ff && \
-        success "Merge successful (not committed — check with git status)" || \
-        { error "Conflicts detected — resolve them manually."; exit 1; }
+    git merge "$wt_branch" --no-ff && \
+        success "Merged '$wt_branch' into '$base_branch'" || \
+        { error "Conflicts detected — resolve them, then run 'git commit' to conclude the merge."; exit 1; }
 
     echo ""
     read -rp "Delete the workspace? (y/N): " cleanup
