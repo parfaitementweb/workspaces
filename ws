@@ -77,6 +77,17 @@ site_name() {
     _truncate_label "${proj}-${slug}"
 }
 
+# Accept either a branch name or an existing site name (as shown by `ws status`)
+resolve_site_name() {
+    local root
+    root="$(find_project_root)"
+    if [[ -d "$root/$WORKTREES_DIR/$1" ]]; then
+        echo "$1"
+    else
+        site_name "$1"
+    fi
+}
+
 # Worktree path (uses site_name for the directory)
 worktree_path() {
     local root sname
@@ -1233,9 +1244,12 @@ _select_workspace() {
     local wt_path
 
     if [[ -n "$arg" ]]; then
-        wt_path="$(worktree_path "$arg")"
+        local root sname
+        root="$(find_project_root)"
+        sname="$(resolve_site_name "$arg")"
+        wt_path="$root/$WORKTREES_DIR/$sname"
         if [[ ! -d "$wt_path" ]]; then
-            error "Workspace '$(site_name "$arg")' not found."
+            error "Workspace '$sname' not found."
             exit 1
         fi
     elif wt_path="$(detect_current_worktree)"; then
@@ -1386,7 +1400,7 @@ cmd_status() {
 
         url_display="${proto}://$name.test"
 
-        echo -e "  ${BOLD}$name${NC}  ${DIM}($branch)${NC}${dirty_flag}  ${CYAN}+$commits_ahead${NC}  $db_status  $herd_status  ${DIM}→ $url_display${NC}"
+        echo -e "  ${BOLD}$branch${NC}${dirty_flag}  ${CYAN}+$commits_ahead${NC}  $db_status  $herd_status  ${DIM}→ $url_display${NC}"
 
         while IFS=: read -r prefix env_var; do
             [[ -z "$prefix" ]] && continue
@@ -1403,7 +1417,7 @@ cmd_preview() {
     local sname wt_path
 
     if [[ -n "${1:-}" ]]; then
-        sname="$(site_name "$1")"
+        sname="$(resolve_site_name "$1")"
     elif wt_path="$(detect_current_worktree)"; then
         sname="$(basename "$wt_path")"
     else
@@ -1724,8 +1738,8 @@ cmd_destroy() {
 
     local root sname wt_path
     root="$(find_project_root)"
-    sname="$(site_name "$branch_name")"
-    wt_path="$(worktree_path "$branch_name")"
+    sname="$(resolve_site_name "$branch_name")"
+    wt_path="$root/$WORKTREES_DIR/$sname"
 
     if [[ ! -d "$wt_path" ]]; then
         error "Workspace '$sname' not found."
