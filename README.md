@@ -208,7 +208,7 @@ Exit codes: `0` success, `1` user error (bad usage, unknown workspace, refused p
 }
 ```
 
-`site`, `branch`, `path`, `base`, `dirty` and `ahead` (commits ahead of `base`) are always present. `url`, `db`, `test_db` and `herd` are omitted, never `null`, when they do not apply: no `.env`, no test database, Herd not installed. `"stale": true` flags a directory left in `.worktrees/` without a git worktree behind it (`branch` is then `?`); `ws destroy` removes it.
+`site`, `branch`, `path`, `base`, `dirty`, `ahead` (commits ahead of `base`) and `profile` are always present. `url`, `db`, `test_db` and `herd` are omitted, never `null`, when they do not apply: no `.env`, no test database, Herd not installed. `"stale": true` flags a directory left in `.worktrees/` without a git worktree behind it (`branch` is then `?`); `ws destroy` removes it.
 
 ### `ws create <branch> --json`
 
@@ -315,6 +315,17 @@ echo "✔ workspace $WS_BRANCH ready at $WS_URL"
 
 Don't forget `chmod +x .ws/hooks/post-create`. Hooks are optional — if a file is missing or not executable, `ws` silently skips it.
 
+## Profiles
+
+`ws` provisions a workspace according to a profile:
+
+| Profile | What `ws create` does |
+|---|---|
+| `laravel-herd` | Everything described above: `.env` patched, dependencies cloned, database cloned, test database isolated, Herd link, Vite port, caches cleared |
+| `plain` | Worktree, `.env` copied as is when the main checkout has one, `vendor/` and `node_modules/` cloned copy-on-write when a lockfile is present, `.ws/hooks/` hooks. No database, no Herd, no Vite patch |
+
+The profile is resolved once per command: `--plain` flag (`ws create`, `ws setup`), then `"profile"` in `.ws.json`, then detection (`artisan` present and `herd` in the PATH → `laravel-herd`, otherwise `plain`). Hooks receive it as `WS_PROFILE`. `ws status`, `ws finish` and `ws destroy` follow the same rule, so a plain workspace is torn down without touching any database or Herd site, and its JSON record carries `"profile": "plain"` and none of the `url`, `db`, `test_db`, `herd` fields.
+
 ## Configuration (`.ws.json`)
 
 Optional file at the repo root:
@@ -333,6 +344,7 @@ Optional file at the repo root:
 
 | Key | Purpose |
 |---|---|
+| `profile` | `laravel-herd` \| `plain` (default: auto-detected, see Profiles) |
 | `agent` | Agent CLI launched by `ws run` / `ws open` (default `claude`). Env override: `WS_AGENT` |
 | `terminal` | `tmux` \| `iterm` \| `terminal` \| `ghostty` \| `none` (default: auto). Env override: `WS_TERMINAL` |
 | `domain` | Env var holding the project's main host, patched to `<project>-<branch>.test` |

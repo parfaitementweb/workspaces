@@ -452,9 +452,40 @@ _run_hook() {
         WS_URL="${WS_URL:-}" \
         WS_DB="${WS_DB:-}" \
         WS_TEST_DB="${WS_TEST_DB:-}" \
+        WS_PROFILE="${WS_PROFILE:-}" \
         WS_ROOT="$root" \
         "$hook" || warn "Hook $event exited with error"
     fi
+}
+
+# ── Profiles ──
+
+PROFILE_LARAVEL="laravel-herd"
+PROFILE_PLAIN="plain"
+
+# Profile of a project: --plain flag, then .ws.json "profile", then detection
+# (artisan + herd in PATH → laravel-herd, otherwise plain). Exported as WS_PROFILE.
+resolve_profile() {
+    local root="${1:-}" flag="${2:-}"
+    local profile="$flag"
+    [[ -z "$profile" && -n "$root" ]] && profile="$(_ws_config_get "$root" "profile")"
+    if [[ -z "$profile" ]]; then
+        if [[ -n "$root" && -f "$root/artisan" ]] && command -v herd &>/dev/null; then
+            profile="$PROFILE_LARAVEL"
+        else
+            profile="$PROFILE_PLAIN"
+        fi
+    fi
+    case "$profile" in
+        "$PROFILE_LARAVEL"|"$PROFILE_PLAIN") ;;
+        *) fail "Unknown profile '$profile' (laravel-herd|plain)" ;;
+    esac
+    export WS_PROFILE="$profile"
+    echo "$profile"
+}
+
+_profile_is_plain() {
+    [[ "${1:-$WS_PROFILE}" == "$PROFILE_PLAIN" ]]
 }
 
 # ── Workspace record (shared by status, info and JSON events) ──
@@ -485,6 +516,8 @@ _workspace_record() {
     WR_AHEAD="$(git -C "$dir" rev-list --count "$base_ref..HEAD" 2>/dev/null || echo 0)"
     [[ "$WR_AHEAD" =~ ^[0-9]+$ ]] || WR_AHEAD=0
     WR_URL="" WR_DB="" WR_TEST_DB="" WR_HERD=""
+    WR_PROFILE="$(resolve_profile "$root")"
+    _profile_is_plain "$WR_PROFILE" && return 0
     if [[ -f "$dir/.env" ]]; then
         WR_URL="$(_get_env_var "$dir/.env" APP_URL)"
         WR_DB="$(_get_env_var "$dir/.env" DB_DATABASE)"
@@ -499,7 +532,7 @@ _workspace_record() {
 _workspace_json() {
     local json
     json="{\"site\":$(_json_str "$WR_SITE"),\"branch\":$(_json_str "$WR_BRANCH"),\"path\":$(_json_str "$WR_PATH")"
-    json+=",\"base\":$(_json_str "$WR_BASE"),\"dirty\":$WR_DIRTY,\"ahead\":$WR_AHEAD"
+    json+=",\"base\":$(_json_str "$WR_BASE"),\"dirty\":$WR_DIRTY,\"ahead\":$WR_AHEAD,\"profile\":$(_json_str "$WR_PROFILE")"
     [[ -z "$WR_URL" ]]     || json+=",\"url\":$(_json_str "$WR_URL")"
     [[ -z "$WR_DB" ]]      || json+=",\"db\":$(_json_str "$WR_DB")"
     [[ -z "$WR_TEST_DB" ]] || json+=",\"test_db\":$(_json_str "$WR_TEST_DB")"
@@ -618,13 +651,14 @@ EOF
 # ── CREATE ──
 
 cmd_create() {
-    local branch_name="" secure="" fresh="" open_after="" agent_flag="" from_flag=""
+    local branch_name="" secure="" fresh="" open_after="" agent_flag="" from_flag="" profile_flag=""
     local -a agent_args=()
 
     while (( $# )); do
         case "$1" in
             --secure)  secure="--secure" ;;
             --fresh)   fresh="--fresh" ;;
+            --plain)   profile_flag="$PROFILE_PLAIN" ;;
             --open)    open_after="1" ;;
             --from)    from_flag="${2:-}"; shift ;;
             --from=*)  from_flag="${1#--from=}" ;;
@@ -640,10 +674,11 @@ cmd_create() {
         shift
     done
 
-    [[ -n "$branch_name" ]] || fail "Usage: ws create <branch-name|pr:NUMBER> [--from <branch>] [--secure] [--fresh] [--open] [--agent <cmd>]"
+    [[ -n "$branch_name" ]] || fail "Usage: ws create <branch-name|pr:NUMBER> [--from <branch>] [--secure] [--fresh] [--plain] [--open] [--agent <cmd>]"
 
     local root
     root="$(find_project_root)"
+    resolve_profile "$root" "$profile_flag" >/dev/null
 
     # PR checkout mode: ws create pr:123 → fetch pull/123/head into pr-123, then use it
     if [[ "$branch_name" =~ ^pr:([0-9]+)$ ]]; then
@@ -721,12 +756,13 @@ _create_failed() {
 # ── SETUP (provision the current directory as a workspace) ──
 
 cmd_setup() {
-    local secure="" fresh="" source_root="" name_override="" standalone=""
+    local secure="" fresh="" source_root="" name_override="" standalone="" profile_flag=""
 
     while (( $# )); do
         case "$1" in
             --secure)     secure="--secure" ;;
             --fresh)      fresh="--fresh" ;;
+            --plain)      profile_flag="$PROFILE_PLAIN" ;;
             --from)       source_root="${2:-}"; shift ;;
             --from=*)     source_root="${1#--from=}" ;;
             --name)       name_override="${2:-}"; shift ;;
@@ -768,7 +804,8 @@ cmd_setup() {
         sname="$(_truncate_label "$(slugify "$(basename "$wt_path")")")"
     fi
 
-    header "Provisioning workspace: $sname"
+    resolve_profile "${source_root:-$wt_path}" "$profile_flag" >/dev/null
+    header "Provisioning workspace: $sname ($WS_PROFILE)"
     [[ -n "$source_root" ]] && info "Source: $source_root"
 
     _provision "$source_root" "$branch_name" "$sname" "$wt_path" "$secure" "$fresh"
@@ -808,7 +845,8 @@ _provision() {
     export WS_BRANCH="$branch_name"
     export WS_SITE="$sname"
     export WS_DIR="$wt_path"
-    export WS_URL="${proto}://${sname}.test"
+    export WS_URL=""
+    _profile_is_plain || export WS_URL="${proto}://${sname}.test"
     export WS_ROOT="$root"
 
     cd "$wt_path"
@@ -816,13 +854,24 @@ _provision() {
     _run_hook "pre-create" "$root"
     emit_step hooks done "pre-create"
     emit_step env running
-    _setup_env "$root" "$sname" "$secure"
+    if _profile_is_plain; then
+        _setup_env_plain "$root"
+    else
+        _setup_env "$root" "$sname" "$secure"
+    fi
     emit_step env done
     emit_step deps running
     _setup_agent_files "$root"
     _setup_composer "$root"
     _setup_npm "$root"
     emit_step deps done
+    if _profile_is_plain; then
+        info "Plain profile: no database, Herd link or Vite patch"
+        emit_step hooks running "post-create"
+        _run_hook "post-create" "$root"
+        emit_step hooks done "post-create"
+        return 0
+    fi
     emit_step db running
     _setup_database "$branch_name" "$root" "$fresh"
     emit_step db done
@@ -854,33 +903,44 @@ _print_summary() {
 
     echo ""
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}✓${NC} ${BOLD}Workspace ready!${NC}"
+    echo -e "${GREEN}✓${NC} ${BOLD}Workspace ready!${NC} ${DIM}(${WS_PROFILE:-$PROFILE_LARAVEL})${NC}"
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
-    echo -e "  ${BOLD}URL${NC}       ${CYAN}${url}${NC}"
+    _profile_is_plain || echo -e "  ${BOLD}URL${NC}       ${CYAN}${url}${NC}"
     echo -e "  ${BOLD}Branch${NC}    ${branch_name}"
     echo -e "  ${BOLD}Path${NC}      ${DIM}${wt_path}${NC}"
 
-    if [[ -f "$wt_path/.env" ]]; then
-        local ws_db
-        ws_db="$(_get_env_var "$wt_path/.env" DB_DATABASE)"
-        [[ -n "$ws_db" ]] && echo -e "  ${BOLD}Database${NC}  ${ws_db}"
-    fi
+    if ! _profile_is_plain; then
+        if [[ -f "$wt_path/.env" ]]; then
+            local ws_db
+            ws_db="$(_get_env_var "$wt_path/.env" DB_DATABASE)"
+            [[ -n "$ws_db" ]] && echo -e "  ${BOLD}Database${NC}  ${ws_db}"
+        fi
 
-    local ws_test_db
-    ws_test_db="$(_detect_test_db "$wt_path")"
-    [[ -n "$ws_test_db" ]] && echo -e "  ${BOLD}Test DB${NC}   ${ws_test_db}"
+        local ws_test_db
+        ws_test_db="$(_detect_test_db "$wt_path")"
+        [[ -n "$ws_test_db" ]] && echo -e "  ${BOLD}Test DB${NC}   ${ws_test_db}"
+    fi
 
     echo ""
     echo -e "  ${DIM}Get started:${NC}          cd ${wt_path}"
     echo -e "  ${DIM}Launch agent here:${NC}    ws run"
     echo -e "  ${DIM}Launch in new tab:${NC}    ws open ${branch_name}"
-    echo -e "  ${DIM}Open in browser:${NC}      ws preview"
+    _profile_is_plain || echo -e "  ${DIM}Open in browser:${NC}      ws preview"
     echo -e "  ${DIM}When done:${NC}            ws finish ${branch_name}  ${DIM}# PR / merge / abandon, then cleanup${NC}"
     echo ""
 }
 
 # ── SETUP HELPERS ──
+
+# Plain profile: bring the local .env along, untouched
+_setup_env_plain() {
+    local root="$1"
+    if [[ -n "$root" && -f "$root/.env" && ! -f ".env" ]]; then
+        cp "$root/.env" .env
+        success ".env copied from main project"
+    fi
+}
 
 _setup_env() {
     local root="$1"
@@ -1527,6 +1587,10 @@ cmd_status() {
             echo -e "  ${DIM}$sname${NC}  ${YELLOW}stale${NC} ${DIM}(no git worktree, run: ws destroy $sname)${NC}"
             continue
         fi
+        if _profile_is_plain "$WR_PROFILE"; then
+            echo -e "  ${BOLD}$WR_BRANCH${NC}${dirty_flag}  ${CYAN}+$WR_AHEAD${NC}  ${DIM}plain → $WR_PATH${NC}"
+            continue
+        fi
         echo -e "  ${BOLD}$WR_BRANCH${NC}${dirty_flag}  ${CYAN}+$WR_AHEAD${NC}  $db_status  $herd_status  ${DIM}→ $url_display${NC}"
 
         while IFS=: read -r prefix env_var; do
@@ -1847,6 +1911,12 @@ _drop_test_database() {
 _cleanup_workspace() {
     local sname="$1" wt_path="$2" wt_branch="$3" root="$4" keep_db="${5:-}"
 
+    local profile
+    profile="$(resolve_profile "$root")"
+    if _profile_is_plain "$profile"; then
+        keep_db="--keep-db"
+    fi
+
     local vite_pids
     vite_pids=$(pgrep -f "node.*vite.*${sname}" 2>/dev/null || true)
     if [[ -n "$vite_pids" ]]; then
@@ -1854,7 +1924,7 @@ _cleanup_workspace() {
         success "Vite processes killed"
     fi
 
-    if command -v herd &>/dev/null; then
+    if ! _profile_is_plain "$profile" && command -v herd &>/dev/null; then
         herd unsecure "$sname" 2>/dev/null || true
         herd unlink "$sname" 2>/dev/null && \
             success "Herd unlink: $sname" || true
@@ -1867,7 +1937,9 @@ _cleanup_workspace() {
         done < <(_ws_config_subdomains "$root")
     fi
 
-    if [[ "$keep_db" == "--keep-db" ]]; then
+    if _profile_is_plain "$profile"; then
+        :
+    elif [[ "$keep_db" == "--keep-db" ]]; then
         info "Database kept"
     elif [[ -f "$wt_path/.env" ]]; then
         local ws_db db_connection db_user db_pass db_host db_port
@@ -2041,9 +2113,10 @@ cmd_help() {
     echo -e "      --from <branch>                 Branch to start from (default: repo default branch)"
     echo -e "      --secure                        HTTPS via herd secure"
     echo -e "      --fresh                         Empty DB + migrate + seed (default: clone main DB)"
+    echo -e "      --plain                         Worktree + deps only, no DB, Herd or Vite (auto on non-Laravel repos)"
     echo -e "      --open                          Open the agent in a new terminal tab when ready"
     echo -e "      --agent <cmd> [-- args]         Agent to launch (default: claude)"
-    echo -e "  ws setup [--from <repo>] [--name <site>] [--secure] [--fresh] [--standalone]"
+    echo -e "  ws setup [--from <repo>] [--name <site>] [--secure] [--fresh] [--plain] [--standalone]"
     echo -e "                                      Provision the current checkout as a workspace"
     echo -e "  ws run [branch] [--agent <cmd>] [-- args]   Launch the agent in the workspace"
     echo -e "  ws open [branch] [--agent <cmd>] [-- args]  Same, in a new terminal tab/window"
@@ -2086,7 +2159,7 @@ cmd_help() {
     echo -e "  E.g.: project ${DIM}my-app${NC} + branch ${DIM}feature/login${NC} → ${CYAN}my-app-feature-login.test${NC}"
     echo ""
     echo -e "${BOLD}Config (.ws.json at repo root):${NC}"
-    echo -e "  ${DIM}{ \"agent\": \"claude\", \"terminal\": \"iterm\",${NC}"
+    echo -e "  ${DIM}{ \"agent\": \"claude\", \"terminal\": \"iterm\", \"profile\": \"laravel-herd\",${NC}"
     echo -e "  ${DIM}  \"domain\": \"APP_DOMAIN\", \"subdomains\": { \"admin\": \"FILAMENT_DOMAIN\" } }${NC}"
     echo -e "  terminal: ${DIM}tmux | iterm | terminal | ghostty | none${NC} (auto-detected by default)"
     echo -e "  Env overrides: ${DIM}WS_AGENT, WS_TERMINAL, WS_SOURCE${NC}"
@@ -2094,7 +2167,7 @@ cmd_help() {
     echo -e "${BOLD}Hooks:${NC}"
     echo -e "  Drop executables in ${CYAN}.ws/hooks/${NC} at the repo root to run on lifecycle events:"
     echo -e "  ${DIM}pre-create, post-create, pre-destroy, post-finish${NC}"
-    echo -e "  Env available to hooks: ${DIM}WS_PROJECT, WS_BRANCH, WS_SITE, WS_DIR, WS_URL, WS_DB, WS_ROOT, WS_EVENT${NC}"
+    echo -e "  Env available to hooks: ${DIM}WS_PROJECT, WS_BRANCH, WS_SITE, WS_DIR, WS_URL, WS_DB, WS_ROOT, WS_EVENT, WS_PROFILE${NC}"
     echo ""
 }
 
