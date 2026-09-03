@@ -466,7 +466,13 @@ _workspace_record() {
     local dir="$root/$WORKTREES_DIR/$sname"
     WR_SITE="$sname"
     WR_PATH="$dir"
+    # A directory left behind after its worktree was pruned makes git answer for the main repo.
+    WR_STALE=""
+    if [[ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" != "$(cd "$dir" && pwd -P)" ]]; then
+        WR_STALE="true"
+    fi
     WR_BRANCH="$(git -C "$dir" branch --show-current 2>/dev/null || true)"
+    [[ -z "$WR_STALE" ]] || WR_BRANCH="?"
     [[ -n "$WR_BRANCH" ]] || WR_BRANCH="$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo "?")"
     WR_BASE="$(_get_ws_base "$root" "$WR_BRANCH")"
     if [[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]; then
@@ -498,6 +504,7 @@ _workspace_json() {
     [[ -z "$WR_DB" ]]      || json+=",\"db\":$(_json_str "$WR_DB")"
     [[ -z "$WR_TEST_DB" ]] || json+=",\"test_db\":$(_json_str "$WR_TEST_DB")"
     [[ -z "$WR_HERD" ]]    || json+=",\"herd\":$WR_HERD"
+    [[ -z "$WR_STALE" ]]   || json+=",\"stale\":true"
     printf '%s}' "$json"
 }
 
@@ -1516,6 +1523,10 @@ cmd_status() {
         proto="$(site_protocol "$sname")"
         url_display="${WR_URL:-${proto}://${sname}.test}"
 
+        if [[ -n "$WR_STALE" ]]; then
+            echo -e "  ${DIM}$sname${NC}  ${YELLOW}stale${NC} ${DIM}(no git worktree, run: ws destroy $sname)${NC}"
+            continue
+        fi
         echo -e "  ${BOLD}$WR_BRANCH${NC}${dirty_flag}  ${CYAN}+$WR_AHEAD${NC}  $db_status  $herd_status  ${DIM}→ $url_display${NC}"
 
         while IFS=: read -r prefix env_var; do
@@ -1558,6 +1569,7 @@ cmd_info() {
     [[ -n "$WR_DB" ]]      && echo -e "  ${BOLD}Database${NC}  ${WR_DB}"
     [[ -n "$WR_TEST_DB" ]] && echo -e "  ${BOLD}Test DB${NC}   ${WR_TEST_DB}"
     [[ -n "$WR_HERD" ]]    && echo -e "  ${BOLD}Herd${NC}      $([[ "$WR_HERD" == "true" ]] && echo -e "${GREEN}linked${NC}" || echo -e "${DIM}not linked${NC}")"
+    [[ -n "$WR_STALE" ]]   && echo -e "  ${BOLD}State${NC}     ${YELLOW}stale${NC} ${DIM}(directory without git worktree)${NC}"
     echo ""
 }
 

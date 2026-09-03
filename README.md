@@ -208,7 +208,7 @@ Exit codes: `0` success, `1` user error (bad usage, unknown workspace, refused p
 }
 ```
 
-`site`, `branch`, `path`, `base`, `dirty` and `ahead` (commits ahead of `base`) are always present. `url`, `db`, `test_db` and `herd` are omitted, never `null`, when they do not apply: no `.env`, no test database, Herd not installed.
+`site`, `branch`, `path`, `base`, `dirty` and `ahead` (commits ahead of `base`) are always present. `url`, `db`, `test_db` and `herd` are omitted, never `null`, when they do not apply: no `.env`, no test database, Herd not installed. `"stale": true` flags a directory left in `.worktrees/` without a git worktree behind it (`branch` is then `?`); `ws destroy` removes it.
 
 ### `ws create <branch> --json`
 
