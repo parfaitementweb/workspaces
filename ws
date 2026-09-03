@@ -6,10 +6,12 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="2.2.0"
+VERSION="3.0.0"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
 MAX_LABEL_LEN=60
+WS_JSON="${WS_JSON:-}"
+WS_OUT=1
 
 # ── Colors ──
 RED='\033[0;31m'
@@ -23,11 +25,54 @@ NC='\033[0m'
 
 # ── Helpers ──
 
-info()    { echo -e "${BLUE}▸${NC} $1"; }
-success() { echo -e "${GREEN}✓${NC} $1"; }
-warn()    { echo -e "${YELLOW}⚠${NC} $1"; }
-error()   { echo -e "${RED}✗${NC} $1" >&2; }
-header()  { echo -e "\n${BOLD}$1${NC}"; }
+# In JSON mode stdout carries machine output only: human messages go to stderr.
+_out() {
+    if [[ -n "$WS_JSON" ]]; then echo -e "$1" >&2; else echo -e "$1"; fi
+}
+info()    { _out "${BLUE}▸${NC} $1"; }
+success() { _out "${GREEN}✓${NC} $1"; }
+warn()    { _out "${YELLOW}⚠${NC} $1"; }
+header()  { _out "\n${BOLD}$1${NC}"; }
+error() {
+    if [[ -n "$WS_JSON" ]]; then
+        printf '{"error":%s}\n' "$(_json_str "$1")" >&2
+    else
+        echo -e "${RED}✗${NC} $1" >&2
+    fi
+}
+# Exit codes: 0 success, 1 user error, 2 environment error
+fail()     { error "$1"; exit 1; }
+fail_env() { error "$1"; exit 2; }
+
+# ── JSON ──
+
+_json_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '"%s"' "$s"
+}
+
+# One NDJSON progress line per step, JSON mode only
+emit_step() {
+    [[ -n "$WS_JSON" ]] || return 0
+    local name="$1" status="$2" message="${3:-}"
+    if [[ -n "$message" ]]; then
+        printf '{"step":%s,"status":%s,"message":%s}\n' "$(_json_str "$name")" "$(_json_str "$status")" "$(_json_str "$message")" >&"$WS_OUT"
+    else
+        printf '{"step":%s,"status":%s}\n' "$(_json_str "$name")" "$(_json_str "$status")" >&"$WS_OUT"
+    fi
+}
+
+# emit_event <name> [extra members]  →  {"event":"<name>",<extra>}
+emit_event() {
+    [[ -n "$WS_JSON" ]] || return 0
+    local name="$1" extra="${2:-}"
+    printf '{"event":%s%s}\n' "$(_json_str "$name")" "${extra:+,$extra}" >&"$WS_OUT"
+}
 
 # Find the nearest main repository root (a directory containing a .git *directory*).
 # From inside a worktree (.git is a file) this walks up to the main repo.
@@ -40,8 +85,7 @@ find_project_root() {
         fi
         dir="$(dirname "$dir")"
     done
-    error "No git repository found in the directory tree."
-    exit 1
+    fail_env "No git repository found in the directory tree."
 }
 
 # Project name from directory
@@ -413,6 +457,50 @@ _run_hook() {
     fi
 }
 
+# ── Workspace record (shared by status, info and JSON events) ──
+
+# Fill the WR_* globals for <root>/.worktrees/<site>.
+# Laravel and Herd fields stay empty when they do not apply.
+_workspace_record() {
+    local root="$1" sname="$2"
+    local dir="$root/$WORKTREES_DIR/$sname"
+    WR_SITE="$sname"
+    WR_PATH="$dir"
+    WR_BRANCH="$(git -C "$dir" branch --show-current 2>/dev/null || true)"
+    [[ -n "$WR_BRANCH" ]] || WR_BRANCH="$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo "?")"
+    WR_BASE="$(_get_ws_base "$root" "$WR_BRANCH")"
+    if [[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]; then
+        WR_DIRTY="true"
+    else
+        WR_DIRTY="false"
+    fi
+    local base_ref
+    base_ref="$(_resolve_start_point "$root" "$WR_BASE" 2>/dev/null || echo "$WR_BASE")"
+    WR_AHEAD="$(git -C "$dir" rev-list --count "$base_ref..HEAD" 2>/dev/null || echo 0)"
+    [[ "$WR_AHEAD" =~ ^[0-9]+$ ]] || WR_AHEAD=0
+    WR_URL="" WR_DB="" WR_TEST_DB="" WR_HERD=""
+    if [[ -f "$dir/.env" ]]; then
+        WR_URL="$(_get_env_var "$dir/.env" APP_URL)"
+        WR_DB="$(_get_env_var "$dir/.env" DB_DATABASE)"
+    fi
+    WR_TEST_DB="$(_detect_test_db "$dir")"
+    if command -v herd &>/dev/null; then
+        if _herd_linked "$sname"; then WR_HERD="true"; else WR_HERD="false"; fi
+        [[ -n "$WR_URL" || "$WR_HERD" != "true" ]] || WR_URL="$(site_protocol "$sname")://${sname}.test"
+    fi
+}
+
+_workspace_json() {
+    local json
+    json="{\"site\":$(_json_str "$WR_SITE"),\"branch\":$(_json_str "$WR_BRANCH"),\"path\":$(_json_str "$WR_PATH")"
+    json+=",\"base\":$(_json_str "$WR_BASE"),\"dirty\":$WR_DIRTY,\"ahead\":$WR_AHEAD"
+    [[ -z "$WR_URL" ]]     || json+=",\"url\":$(_json_str "$WR_URL")"
+    [[ -z "$WR_DB" ]]      || json+=",\"db\":$(_json_str "$WR_DB")"
+    [[ -z "$WR_TEST_DB" ]] || json+=",\"test_db\":$(_json_str "$WR_TEST_DB")"
+    [[ -z "$WR_HERD" ]]    || json+=",\"herd\":$WR_HERD"
+    printf '%s}' "$json"
+}
+
 # ── Agent / terminal ──
 
 # Resolve the agent command: --agent flag > WS_AGENT env > .ws.json "agent" > claude
@@ -545,7 +633,7 @@ cmd_create() {
         shift
     done
 
-    [[ -n "$branch_name" ]] || { error "Usage: ws create <branch-name|pr:NUMBER> [--from <branch>] [--secure] [--fresh] [--open] [--agent <cmd>]"; exit 1; }
+    [[ -n "$branch_name" ]] || fail "Usage: ws create <branch-name|pr:NUMBER> [--from <branch>] [--secure] [--fresh] [--open] [--agent <cmd>]"
 
     local root
     root="$(find_project_root)"
@@ -553,16 +641,14 @@ cmd_create() {
     # PR checkout mode: ws create pr:123 → fetch pull/123/head into pr-123, then use it
     if [[ "$branch_name" =~ ^pr:([0-9]+)$ ]]; then
         local pr_num="${BASH_REMATCH[1]}"
-        if ! command -v gh >/dev/null 2>&1; then
-            error "gh CLI is required for PR checkout (install: https://cli.github.com)"
-            exit 1
-        fi
+        command -v gh >/dev/null 2>&1 \
+            || _create_failed worktree "gh CLI is required for PR checkout (install: https://cli.github.com)" 2
         info "Fetching PR #${pr_num}..."
         local head_ref
         head_ref=$(gh pr view "$pr_num" --json headRefName -q .headRefName 2>/dev/null) \
-            || { error "PR #${pr_num} not found"; exit 1; }
+            || _create_failed worktree "PR #${pr_num} not found" 1
         git -C "$root" fetch origin "pull/${pr_num}/head:pr-${pr_num}" 2>/dev/null \
-            || { error "Failed to fetch pull/${pr_num}/head"; exit 1; }
+            || _create_failed worktree "Failed to fetch pull/${pr_num}/head" 2
         branch_name="pr-${pr_num}"
         success "PR #${pr_num} (${head_ref}) fetched as branch ${branch_name}"
     fi
@@ -571,12 +657,10 @@ cmd_create() {
     sname="$(site_name "$branch_name")"
     wt_path="$(worktree_path "$branch_name")"
 
-    if [[ -d "$wt_path" ]]; then
-        error "Workspace '$sname' already exists: $wt_path"
-        exit 1
-    fi
+    [[ -d "$wt_path" ]] && _create_failed worktree "Workspace '$sname' already exists: $wt_path" 1
 
     header "Creating workspace: $sname"
+    emit_step worktree running
 
     if ! grep -qx "$WORKTREES_DIR" "$root/.gitignore" 2>/dev/null; then
         echo "$WORKTREES_DIR" >> "$root/.gitignore"
@@ -588,30 +672,43 @@ cmd_create() {
         [[ -n "$from_flag" ]] && warn "Branch '$branch_name' already exists — --from '$from_flag' ignored"
         info "Creating worktree on existing branch '$branch_name'..."
         git worktree add "$wt_path" "$branch_name" \
-            || { error "Failed to create worktree for branch '$branch_name'"; exit 1; }
+            || _create_failed worktree "Failed to create worktree for branch '$branch_name'" 2
     else
         local start_ref start_point
         start_ref="${from_flag:-$(detect_default_branch)}"
         start_point="$(_resolve_start_point "$root" "$start_ref")" \
-            || { error "Start point '$start_ref' not found (neither local branch, origin branch, nor commit)"; exit 1; }
+            || _create_failed worktree "Start point '$start_ref' not found (neither local branch, origin branch, nor commit)" 1
         info "Creating worktree on branch '$branch_name' from '$start_point'..."
         git worktree add "$wt_path" -b "$branch_name" "$start_point" \
-            || { error "Failed to create worktree for branch '$branch_name' from '$start_point'"; exit 1; }
+            || _create_failed worktree "Failed to create worktree for branch '$branch_name' from '$start_point'" 2
         if git -C "$root" show-ref --verify --quiet "refs/heads/$start_ref" 2>/dev/null \
            || git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$start_ref" 2>/dev/null; then
             _set_ws_base "$root" "$branch_name" "$start_ref"
         fi
     fi
     success "Worktree created: $wt_path"
+    emit_step worktree done
 
     _provision "$root" "$branch_name" "$sname" "$wt_path" "$secure" "$fresh"
-    _print_summary "$sname" "$branch_name" "$wt_path"
+    if [[ -n "$WS_JSON" ]]; then
+        _workspace_record "$root" "$sname"
+        emit_event ready "\"workspace\":$(_workspace_json)"
+    else
+        _print_summary "$sname" "$branch_name" "$wt_path"
+    fi
 
     if [[ -n "$open_after" ]]; then
         local agent
         agent="$(_resolve_agent "$agent_flag" "$root")"
         _open_terminal "$wt_path" "$sname" "$agent $(_shell_quote ${agent_args[@]+"${agent_args[@]}"})" "$root"
     fi
+}
+
+# <step> <message> <exit-code>: report a hard failure of ws create in both output modes
+_create_failed() {
+    emit_event failed "\"step\":$(_json_str "$1"),\"message\":$(_json_str "$2")"
+    error "$2"
+    exit "${3:-1}"
 }
 
 # ── SETUP (provision the current directory as a workspace) ──
@@ -635,7 +732,7 @@ cmd_setup() {
 
     local wt_path
     wt_path="$(git rev-parse --show-toplevel 2>/dev/null)" \
-        || { error "Not inside a git checkout."; exit 1; }
+        || fail_env "Not inside a git checkout."
 
     [[ -z "$source_root" ]] && source_root="${WS_SOURCE:-}"
     [[ -z "$source_root" ]] && source_root="$(_resolve_source_root "$wt_path")"
@@ -668,7 +765,11 @@ cmd_setup() {
     [[ -n "$source_root" ]] && info "Source: $source_root"
 
     _provision "$source_root" "$branch_name" "$sname" "$wt_path" "$secure" "$fresh"
-    _print_summary "$sname" "$branch_name" "$wt_path"
+    if [[ -n "$WS_JSON" ]]; then
+        emit_event ready "\"site\":$(_json_str "$sname"),\"branch\":$(_json_str "$branch_name"),\"path\":$(_json_str "$wt_path")"
+    else
+        _print_summary "$sname" "$branch_name" "$wt_path"
+    fi
 }
 
 # Guess the main repository for an arbitrary checkout:
@@ -704,18 +805,38 @@ _provision() {
     export WS_ROOT="$root"
 
     cd "$wt_path"
+    emit_step hooks running "pre-create"
     _run_hook "pre-create" "$root"
+    emit_step hooks done "pre-create"
+    emit_step env running
     _setup_env "$root" "$sname" "$secure"
+    emit_step env done
+    emit_step deps running
     _setup_agent_files "$root"
     _setup_composer "$root"
     _setup_npm "$root"
+    emit_step deps done
+    emit_step db running
     _setup_database "$branch_name" "$root" "$fresh"
+    emit_step db done
+    emit_step test_db running
     _setup_test_database "$branch_name" "$root"
+    emit_step test_db done
+    emit_step storage running
     _setup_storage "$root"
+    emit_step storage done
+    emit_step herd running
     _setup_herd "$sname" "$secure" "$wt_path" "$root"
+    emit_step herd done
+    emit_step vite running
     _setup_vite
+    emit_step vite done
+    emit_step caches running
     _clear_cache
+    emit_step caches done
+    emit_step hooks running "post-create"
     _run_hook "post-create" "$root"
+    emit_step hooks done "post-create"
 }
 
 _print_summary() {
@@ -1260,9 +1381,9 @@ _select_workspace() {
         local wt_dir="$root/$WORKTREES_DIR"
 
         if [[ ! -d "$wt_dir" ]] || [[ -z "$(ls -A "$wt_dir" 2>/dev/null)" ]]; then
-            error "No workspace found. Use: ws create <branch-name>"
-            exit 1
+            fail "No workspace found. Use: ws create <branch-name>"
         fi
+        [[ -z "$WS_JSON" ]] || fail "A workspace name is required in --json mode"
 
         header "Available workspaces:" >&2
         local i=1
@@ -1322,10 +1443,7 @@ cmd_run() {
     local agent
     agent="$(_resolve_agent "$SEL_AGENT" "$root")"
 
-    if ! command -v "$agent" &>/dev/null; then
-        error "Agent '$agent' is not installed or not in PATH."
-        exit 1
-    fi
+    command -v "$agent" &>/dev/null || fail_env "Agent '$agent' is not installed or not in PATH."
 
     info "Launching $agent in '$(basename "$wt_path")'..."
     echo -e "${DIM}─────────────────────────────────────${NC}"
@@ -1356,58 +1474,90 @@ cmd_status() {
     local root
     root="$(find_project_root)"
     local wt_dir="$root/$WORKTREES_DIR"
-    local default_branch
-    default_branch="$(detect_default_branch)"
+
+    local -a sites=()
+    local dir
+    if [[ -d "$wt_dir" ]]; then
+        for dir in "$wt_dir"/*/; do
+            [[ -d "$dir" ]] || continue
+            sites+=("$(basename "$dir")")
+        done
+    fi
+
+    local sname
+    if [[ -n "$WS_JSON" ]]; then
+        local separator=""
+        printf '[' >&"$WS_OUT"
+        for sname in ${sites[@]+"${sites[@]}"}; do
+            _workspace_record "$root" "$sname"
+            printf '%s' "$separator" >&"$WS_OUT"
+            _workspace_json >&"$WS_OUT"
+            separator=","
+        done
+        printf ']\n' >&"$WS_OUT"
+        return 0
+    fi
 
     header "$(project_name) — Workspaces"
     echo ""
 
-    if [[ ! -d "$wt_dir" ]] || [[ -z "$(ls -A "$wt_dir" 2>/dev/null)" ]]; then
+    if (( ${#sites[@]} == 0 )); then
         echo -e "  ${DIM}No workspaces.${NC}"
         echo -e "  ${DIM}Use: ws create <branch-name>${NC}"
         return 0
     fi
 
-    for dir in "$wt_dir"/*/; do
-        [[ -d "$dir" ]] || continue
-        local name branch commits_ahead db_status herd_status url_display dirty_flag
-        name="$(basename "$dir")"
+    for sname in "${sites[@]}"; do
+        _workspace_record "$root" "$sname"
+        local dirty_flag="" db_status herd_status url_display proto
+        [[ "$WR_DIRTY" == "true" ]] && dirty_flag=" ${YELLOW}●${NC}"
+        if [[ -n "$WR_DB" ]]; then db_status="${GREEN}✓${NC} DB"; else db_status="${DIM}– DB${NC}"; fi
+        if [[ "$WR_HERD" == "true" ]]; then herd_status="${GREEN}✓${NC} Herd"; else herd_status="${DIM}– Herd${NC}"; fi
+        proto="$(site_protocol "$sname")"
+        url_display="${WR_URL:-${proto}://${sname}.test}"
 
-        branch=$(git -C "$dir" branch --show-current 2>/dev/null || echo "?")
-
-        if [[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]; then
-            dirty_flag=" ${YELLOW}●${NC}"
-        else
-            dirty_flag=""
-        fi
-
-        commits_ahead=$(git -C "$dir" rev-list --count "$default_branch..HEAD" 2>/dev/null || echo "?")
-
-        if [[ -f "$dir/.env" && -n "$(_get_env_var "$dir/.env" DB_DATABASE)" ]]; then
-            db_status="${GREEN}✓${NC} DB"
-        else
-            db_status="${DIM}– DB${NC}"
-        fi
-
-        local proto="http"
-        detect_herd_secure "$name" && proto="https"
-
-        if _herd_linked "$name"; then
-            herd_status="${GREEN}✓${NC} Herd"
-        else
-            herd_status="${DIM}– Herd${NC}"
-        fi
-
-        url_display="${proto}://$name.test"
-
-        echo -e "  ${BOLD}$branch${NC}${dirty_flag}  ${CYAN}+$commits_ahead${NC}  $db_status  $herd_status  ${DIM}→ $url_display${NC}"
+        echo -e "  ${BOLD}$WR_BRANCH${NC}${dirty_flag}  ${CYAN}+$WR_AHEAD${NC}  $db_status  $herd_status  ${DIM}→ $url_display${NC}"
 
         while IFS=: read -r prefix env_var; do
             [[ -z "$prefix" ]] && continue
-            echo -e "  ${DIM}└─ → ${proto}://${prefix}.${name}.test${NC}"
+            echo -e "  ${DIM}└─ → ${proto}://${prefix}.${sname}.test${NC}"
         done < <(_ws_config_subdomains "$root")
     done
 
+    echo ""
+}
+
+# ── INFO ──
+
+cmd_info() {
+    local root sname wt_path
+    root="$(find_project_root)"
+
+    if [[ -n "${1:-}" ]]; then
+        sname="$(resolve_site_name "$1")"
+    elif wt_path="$(detect_current_worktree)"; then
+        sname="$(basename "$wt_path")"
+    else
+        fail "Usage: ws info <branch-name> (or run from a worktree)"
+    fi
+    [[ -d "$root/$WORKTREES_DIR/$sname" ]] || fail "Workspace '$sname' not found."
+
+    _workspace_record "$root" "$sname"
+
+    if [[ -n "$WS_JSON" ]]; then
+        _workspace_json >&"$WS_OUT"
+        printf '\n' >&"$WS_OUT"
+        return 0
+    fi
+
+    header "$WR_SITE"
+    echo ""
+    echo -e "  ${BOLD}Branch${NC}    ${WR_BRANCH}  ${DIM}(from ${WR_BASE}, +${WR_AHEAD})${NC}$([[ "$WR_DIRTY" == "true" ]] && echo -e "  ${YELLOW}● uncommitted changes${NC}")"
+    echo -e "  ${BOLD}Path${NC}      ${DIM}${WR_PATH}${NC}"
+    [[ -n "$WR_URL" ]]     && echo -e "  ${BOLD}URL${NC}       ${CYAN}${WR_URL}${NC}"
+    [[ -n "$WR_DB" ]]      && echo -e "  ${BOLD}Database${NC}  ${WR_DB}"
+    [[ -n "$WR_TEST_DB" ]] && echo -e "  ${BOLD}Test DB${NC}   ${WR_TEST_DB}"
+    [[ -n "$WR_HERD" ]]    && echo -e "  ${BOLD}Herd${NC}      $([[ "$WR_HERD" == "true" ]] && echo -e "${GREEN}linked${NC}" || echo -e "${DIM}not linked${NC}")"
     echo ""
 }
 
@@ -1421,8 +1571,7 @@ cmd_preview() {
     elif wt_path="$(detect_current_worktree)"; then
         sname="$(basename "$wt_path")"
     else
-        error "Usage: ws preview <branch-name> (or run from a worktree)"
-        exit 1
+        fail "Usage: ws preview <branch-name> (or run from a worktree)"
     fi
 
     local proto
@@ -1438,16 +1587,27 @@ cmd_finish() {
     local root
     root="$(find_project_root)"
 
-    local branch_arg="" into_flag=""
+    local branch_arg="" into_flag="" finish_mode=""
+    FINISH_AUTO="" FINISH_MESSAGE="" FINISH_TITLE="" FINISH_CLEANUP="" FINISH_PR_URL="" WS_REMOVED=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --into)    into_flag="${2:-}"; shift ;;
-            --into=*)  into_flag="${1#--into=}" ;;
-            -*)        error "Unknown option: $1"; exit 1 ;;
-            *)         branch_arg="$1" ;;
+            --into)       into_flag="${2:-}"; shift ;;
+            --into=*)     into_flag="${1#--into=}" ;;
+            --pr)         finish_mode="pr" ;;
+            --merge)      finish_mode="merge" ;;
+            --abandon)    finish_mode="abandon" ;;
+            --message|-m) FINISH_MESSAGE="${2:-}"; shift ;;
+            --message=*)  FINISH_MESSAGE="${1#--message=}" ;;
+            --title)      FINISH_TITLE="${2:-}"; shift ;;
+            --title=*)    FINISH_TITLE="${1#--title=}" ;;
+            --cleanup)    FINISH_CLEANUP="1" ;;
+            -*)           fail "Unknown option: $1" ;;
+            *)            branch_arg="$1" ;;
         esac
         shift
     done
+    [[ -n "$finish_mode" ]] && FINISH_AUTO="1"
+    [[ -n "$finish_mode" || -z "$WS_JSON" ]] || fail "ws finish --json requires --pr, --merge or --abandon"
 
     local wt_path sname wt_branch
     wt_path="$(_select_workspace "$branch_arg" "Which workspace to finish?")"
@@ -1459,8 +1619,7 @@ cmd_finish() {
     base_branch="${into_flag:-$(_get_ws_base "$root" "$wt_branch")}"
     if ! git -C "$root" show-ref --verify --quiet "refs/heads/$base_branch" 2>/dev/null \
        && ! git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$base_branch" 2>/dev/null; then
-        error "Base branch '$base_branch' not found."
-        exit 1
+        fail "Base branch '$base_branch' not found."
     fi
 
     if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
@@ -1468,12 +1627,20 @@ cmd_finish() {
     fi
 
     header "Finish workspace '$sname' ($wt_branch → $base_branch)"
-    echo ""
-    echo -e "  ${CYAN}1)${NC} Create a PR against '$base_branch' ${DIM}(recommended)${NC}"
-    echo -e "  ${CYAN}2)${NC} Merge locally into '$base_branch'"
-    echo -e "  ${CYAN}3)${NC} Abandon changes"
-    echo ""
-    read -rp "Choice (1-3): " finish_choice
+    if [[ -z "$finish_mode" ]]; then
+        echo ""
+        echo -e "  ${CYAN}1)${NC} Create a PR against '$base_branch' ${DIM}(recommended)${NC}"
+        echo -e "  ${CYAN}2)${NC} Merge locally into '$base_branch'"
+        echo -e "  ${CYAN}3)${NC} Abandon changes"
+        echo ""
+        read -rp "Choice (1-3): " finish_choice
+        case "$finish_choice" in
+            1) finish_mode="pr" ;;
+            2) finish_mode="merge" ;;
+            3) finish_mode="abandon" ;;
+            *) fail "Invalid choice." ;;
+        esac
+    fi
 
     export WS_PROJECT="$(basename "$root")"
     export WS_BRANCH="$wt_branch"
@@ -1482,17 +1649,52 @@ cmd_finish() {
     export WS_ROOT="$root"
     export WS_BASE="$base_branch"
 
-    case "$finish_choice" in
-        1) _finish_pr "$sname" "$wt_path" "$wt_branch" "$root" "$base_branch" ;;
-        2) _finish_merge "$sname" "$wt_path" "$wt_branch" "$root" "$base_branch" ;;
-        3) _finish_abandon "$sname" "$wt_path" "$wt_branch" "$root" ;;
-        *)
-            error "Invalid choice."
-            exit 1
-            ;;
+    case "$finish_mode" in
+        pr)      _finish_pr "$sname" "$wt_path" "$wt_branch" "$root" "$base_branch" ;;
+        merge)   _finish_merge "$sname" "$wt_path" "$wt_branch" "$root" "$base_branch" ;;
+        abandon) _finish_abandon "$sname" "$wt_path" "$wt_branch" "$root" ;;
     esac
 
     _run_hook "post-finish" "$root"
+
+    local removed="false"
+    [[ -z "$WS_REMOVED" ]] || removed="true"
+    local extra
+    extra="\"mode\":$(_json_str "$finish_mode"),\"site\":$(_json_str "$sname"),\"branch\":$(_json_str "$wt_branch"),\"base\":$(_json_str "$base_branch")"
+    [[ -z "$FINISH_PR_URL" ]] || extra+=",\"pr_url\":$(_json_str "$FINISH_PR_URL")"
+    emit_event finished "${extra},\"workspace_removed\":${removed}"
+}
+
+# Commit pending changes, prompting for the message unless running non-interactively
+_finish_commit_changes() {
+    local sname="$1" wt_path="$2"
+    [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]] || return 0
+    local commit_msg="$FINISH_MESSAGE"
+    if [[ -n "$FINISH_AUTO" ]]; then
+        [[ -n "$commit_msg" ]] || fail "Uncommitted changes in '$sname': commit them first or pass --message"
+    else
+        echo ""
+        read -rp "Commit message: " commit_msg
+    fi
+    git -C "$wt_path" add -A
+    git -C "$wt_path" commit -m "$commit_msg"
+    success "Changes committed"
+}
+
+# Delete the workspace after a PR or a merge: --cleanup when non-interactive, otherwise ask
+_finish_maybe_cleanup() {
+    local sname="$1" wt_path="$2" wt_branch="$3" root="$4"
+    local cleanup="$FINISH_CLEANUP"
+    if [[ -z "$FINISH_AUTO" ]]; then
+        echo ""
+        read -rp "Delete the workspace now? (y/N): " cleanup
+        [[ "$cleanup" =~ ^[yY]$ ]] && cleanup="1" || cleanup=""
+    fi
+    if [[ -n "$cleanup" ]]; then
+        _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root"
+    else
+        info "Workspace kept. Use 'ws destroy' to remove it later."
+    fi
 }
 
 _finish_pr() {
@@ -1500,72 +1702,64 @@ _finish_pr() {
 
     cd "$wt_path"
 
-    if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
-        echo ""
-        read -rp "Commit message: " commit_msg
-        git add -A
-        git commit -m "$commit_msg"
-        success "Changes committed"
-    fi
+    _finish_commit_changes "$sname" "$wt_path"
 
     info "Pushing branch '$wt_branch'..."
     git push -u origin "$wt_branch" 2>/dev/null && \
         success "Branch pushed" || \
-        { error "Push failed."; exit 1; }
+        fail_env "Push failed."
 
     if command -v gh &>/dev/null; then
-        echo ""
-        read -rp "PR title: " pr_title
+        local pr_title="$FINISH_TITLE" pr_body="" desc_choice="2"
+        if [[ -n "$FINISH_AUTO" ]]; then
+            [[ -n "$pr_title" ]] || pr_title="$(git log -1 --pretty=%s 2>/dev/null || echo "$wt_branch")"
+        else
+            echo ""
+            read -rp "PR title: " pr_title
 
-        echo ""
-        echo -e "  ${CYAN}1)${NC} I'll write the description on GitHub"
-        echo -e "  ${CYAN}2)${NC} Generate from diff"
-        echo -e "  ${CYAN}3)${NC} No description"
-        echo ""
-        read -rp "Description (1-3): " desc_choice
+            echo ""
+            echo -e "  ${CYAN}1)${NC} I'll write the description on GitHub"
+            echo -e "  ${CYAN}2)${NC} Generate from diff"
+            echo -e "  ${CYAN}3)${NC} No description"
+            echo ""
+            read -rp "Description (1-3): " desc_choice
+        fi
 
-        local pr_body=""
         case "$desc_choice" in
             2) pr_body=$(git log "$base_branch..$wt_branch" --pretty=format:"- %s" 2>/dev/null) ;;
-            3) pr_body="" ;;
+            *) pr_body="" ;;
         esac
 
-        gh pr create --base "$base_branch" --title "$pr_title" --body "$pr_body" 2>/dev/null && \
-            success "PR created!" || \
+        local pr_url
+        if pr_url="$(gh pr create --base "$base_branch" --title "$pr_title" --body "$pr_body" 2>/dev/null)"; then
+            FINISH_PR_URL="$(printf '%s' "$pr_url" | grep -Eo 'https?://[^[:space:]]+' | tail -1 || true)"
+            success "PR created! ${FINISH_PR_URL}"
+        else
             warn "PR creation failed — create it manually on GitHub"
+        fi
     else
         warn "gh CLI not installed — create the PR manually on GitHub"
     fi
 
-    echo ""
-    read -rp "Delete the workspace now? (y/N): " cleanup
-    if [[ "$cleanup" =~ ^[yY]$ ]]; then
-        _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root"
-    else
-        info "Workspace kept. Use 'ws destroy' to remove it later."
-    fi
+    _finish_maybe_cleanup "$sname" "$wt_path" "$wt_branch" "$root"
 }
 
 _finish_merge() {
     local sname="$1" wt_path="$2" wt_branch="$3" root="$4" base_branch="$5"
 
     if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
-        warn "There are uncommitted changes in '$sname'."
-        read -rp "Commit them before merging? (Y/n): " do_commit
-        if [[ ! "$do_commit" =~ ^[nN]$ ]]; then
-            cd "$wt_path"
-            echo ""
-            read -rp "Commit message: " commit_msg
-            git add -A
-            git commit -m "$commit_msg"
-            success "Changes committed"
+        local do_commit="y"
+        if [[ -z "$FINISH_AUTO" ]]; then
+            warn "There are uncommitted changes in '$sname'."
+            read -rp "Commit them before merging? (Y/n): " do_commit
         fi
+        [[ "$do_commit" =~ ^[nN]$ ]] || _finish_commit_changes "$sname" "$wt_path"
     fi
 
     local current_branch default_branch
     current_branch="$(git -C "$root" branch --show-current 2>/dev/null)"
     default_branch="$(detect_default_branch)"
-    if [[ "$base_branch" == "$default_branch" ]]; then
+    if [[ "$base_branch" == "$default_branch" && -z "$FINISH_AUTO" ]]; then
         warn "This will merge directly into '$default_branch'."
         read -rp "Continue? (y/N): " confirm_main
         [[ "$confirm_main" =~ ^[yY]$ ]] || exit 0
@@ -1574,35 +1768,32 @@ _finish_merge() {
     cd "$root"
     if [[ "$current_branch" != "$base_branch" ]]; then
         if [[ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
-            error "The main checkout ('$current_branch') has uncommitted changes — commit or stash them before switching to '$base_branch'."
-            exit 1
+            fail "The main checkout ('$current_branch') has uncommitted changes — commit or stash them before switching to '$base_branch'."
         fi
         info "Switching main checkout from '$current_branch' to '$base_branch'..."
         git checkout "$base_branch" 2>/dev/null \
-            || { error "Failed to check out '$base_branch'."; exit 1; }
+            || fail_env "Failed to check out '$base_branch'."
     fi
 
     header "Merging '$wt_branch' into '$base_branch'"
 
-    git merge "$wt_branch" --no-ff && \
+    git merge "$wt_branch" --no-ff >&2 && \
         success "Merged '$wt_branch' into '$base_branch'" || \
-        { error "Conflicts detected — resolve them, then run 'git commit' to conclude the merge."; exit 1; }
+        fail "Conflicts detected — resolve them, then run 'git commit' to conclude the merge."
 
-    echo ""
-    read -rp "Delete the workspace? (y/N): " cleanup
-    if [[ "$cleanup" =~ ^[yY]$ ]]; then
-        _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root"
-    fi
+    _finish_maybe_cleanup "$sname" "$wt_path" "$wt_branch" "$root"
 }
 
 _finish_abandon() {
     local sname="$1" wt_path="$2" wt_branch="$3" root="$4"
 
-    echo -e "\n${RED}${BOLD}Abandoning workspace '$sname'${NC}"
-    echo -e "  ${DIM}All changes will be lost.${NC}"
-    echo ""
-    read -rp "Confirm? (y/N): " confirm
-    [[ "$confirm" =~ ^[yY]$ ]] || exit 0
+    _out "\n${RED}${BOLD}Abandoning workspace '$sname'${NC}"
+    _out "  ${DIM}All changes will be lost.${NC}"
+    if [[ -z "$FINISH_AUTO" ]]; then
+        echo ""
+        read -rp "Confirm? (y/N): " confirm
+        [[ "$confirm" =~ ^[yY]$ ]] || exit 0
+    fi
 
     _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root"
 }
@@ -1715,7 +1906,8 @@ _cleanup_workspace() {
             warn "Branch '$wt_branch' not deleted (not merged yet?)"
     fi
 
-    echo ""
+    WS_REMOVED="1"
+    _out ""
     success "Workspace '$sname' cleaned up."
 }
 
@@ -1731,29 +1923,24 @@ cmd_destroy() {
         esac
     done
 
-    if [[ -z "$branch_name" ]]; then
-        error "Usage: ws destroy <branch-name> [--keep-db] [--yes]"
-        exit 1
-    fi
+    [[ -n "$branch_name" ]] || fail "Usage: ws destroy <branch-name> [--keep-db] [--yes]"
+    [[ -n "$yes" || -z "$WS_JSON" ]] || fail "ws destroy --json requires --yes"
 
     local root sname wt_path
     root="$(find_project_root)"
     sname="$(resolve_site_name "$branch_name")"
     wt_path="$root/$WORKTREES_DIR/$sname"
 
-    if [[ ! -d "$wt_path" ]]; then
-        error "Workspace '$sname' not found."
-        exit 1
-    fi
+    [[ -d "$wt_path" ]] || fail "Workspace '$sname' not found."
 
     local wt_branch
     wt_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
 
-    echo -e "${RED}${BOLD}Deleting workspace '$sname'${NC}"
-    echo -e "  Worktree: $wt_path"
-    echo -e "  Branch:   $wt_branch"
-    [[ -n "$keep_db" ]] && echo -e "  ${DIM}(database kept)${NC}"
-    echo ""
+    _out "${RED}${BOLD}Deleting workspace '$sname'${NC}"
+    _out "  Worktree: $wt_path"
+    _out "  Branch:   $wt_branch"
+    [[ -z "$keep_db" ]] || _out "  ${DIM}(database kept)${NC}"
+    _out ""
     if [[ -z "$yes" ]]; then
         read -rp "Confirm? (y/N): " confirm
         [[ "$confirm" =~ ^[yY]$ ]] || exit 0
@@ -1767,6 +1954,7 @@ cmd_destroy() {
     _run_hook "pre-destroy" "$root"
 
     _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root" "$keep_db"
+    emit_event destroyed "\"site\":$(_json_str "$sname"),\"branch\":$(_json_str "$wt_branch")"
 }
 
 # ── HOOK (adapter for Claude Code WorktreeCreate / WorktreeRemove) ──
@@ -1848,12 +2036,21 @@ cmd_help() {
     echo -e "  ws run [branch] [--agent <cmd>] [-- args]   Launch the agent in the workspace"
     echo -e "  ws open [branch] [--agent <cmd>] [-- args]  Same, in a new terminal tab/window"
     echo -e "  ws status                           Show all workspaces and their state"
+    echo -e "  ws info [branch]                    Show one workspace"
     echo -e "  ws preview [branch]                 Open the site in the browser"
     echo -e "  ws finish [branch] [--into <branch>] Finish work (PR / merge / abandon)"
     echo -e "      --into <branch>                 Target branch (default: the branch the workspace was created from)"
+    echo -e "      --pr | --merge | --abandon      Skip the menu and every prompt"
+    echo -e "      --message <msg> --title <t>     Commit message / PR title when non-interactive"
+    echo -e "      --cleanup                       Delete the workspace afterwards when non-interactive"
     echo -e "  ws destroy <branch> [--keep-db] [-y] Delete the workspace and Herd link"
     echo -e "  ws hook <create|remove>             Claude Code WorktreeCreate/WorktreeRemove adapter"
     echo -e "  ws help                             Show this help"
+    echo ""
+    echo -e "${BOLD}Machine output:${NC}"
+    echo -e "  Add ${CYAN}--json${NC} to any command: status/info print records, create streams NDJSON steps,"
+    echo -e "  finish/destroy print one event and refuse to prompt. Errors are {\"error\":...} on stderr."
+    echo -e "  Exit codes: 0 success, 1 user error, 2 environment error."
     echo ""
     echo -e "${BOLD}Examples:${NC}"
     echo -e "  ${DIM}cd ~/Sites/my-project${NC}"
@@ -1892,6 +2089,26 @@ cmd_help() {
 # ── MAIN ──
 
 main() {
+    # Global --json flag, accepted anywhere before "--" (agent arguments are left untouched)
+    local -a args=()
+    local arg passthrough=""
+    for arg in "$@"; do
+        if [[ -z "$passthrough" && "$arg" == "--json" ]]; then
+            WS_JSON="1"
+        else
+            [[ "$arg" == "--" ]] && passthrough="1"
+            args+=("$arg")
+        fi
+    done
+    set -- ${args[@]+"${args[@]}"}
+
+    # JSON mode: the real stdout is kept on fd 3 for JSON lines only, everything
+    # else (including the tools ws shells out to) goes to stderr.
+    if [[ -n "$WS_JSON" ]]; then
+        exec 3>&1 1>&2
+        WS_OUT=3
+    fi
+
     local command="${1:-help}"
     shift || true
 
@@ -1901,6 +2118,7 @@ main() {
         run)     cmd_run "$@" ;;
         open)    cmd_open "$@" ;;
         status)  cmd_status "$@" ;;
+        info)    cmd_info "$@" ;;
         preview) cmd_preview "$@" ;;
         finish)  cmd_finish "$@" ;;
         merge)   cmd_finish "$@" ;;
@@ -1910,7 +2128,7 @@ main() {
         help|-h|--help) cmd_help ;;
         *)
             error "Unknown command: $command"
-            cmd_help
+            cmd_help >&2
             exit 1
             ;;
     esac

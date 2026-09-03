@@ -163,6 +163,7 @@ Automatically detects whether the site is HTTP or HTTPS.
 ws finish                            # guided workflow
 ws finish feature/auth               # specific workspace
 ws finish feature/auth --into develop  # override the target branch
+ws finish feature/auth --pr --cleanup  # no prompts: push, open the PR, delete the workspace
 ```
 
 Three options:
@@ -181,6 +182,62 @@ ws destroy feature/auth --yes        # no confirmation prompt
 ```
 
 Deletes the worktree, local branch, database, Herd link(s), and SSL certificate if applicable. Use `--keep-db` to keep the database. The main project's database is never dropped.
+
+## Machine-readable output (`--json`)
+
+Add `--json` to any command. Human output is unchanged without it. In JSON mode stdout carries JSON only: progress and the output of the tools `ws` calls go to stderr, errors are a single `{"error": "..."}` line on stderr, and no command ever prompts.
+
+Exit codes: `0` success, `1` user error (bad usage, unknown workspace, refused prompt), `2` environment error (no git repository, missing tool, git or push failure).
+
+### Workspace record
+
+`ws status --json` prints an array of records, `ws info <branch> --json` a single one:
+
+```json
+{
+  "site": "my-project-feature-auth",
+  "branch": "feature/auth",
+  "path": "/Users/me/Sites/my-project/.worktrees/my-project-feature-auth",
+  "base": "main",
+  "dirty": true,
+  "ahead": 3,
+  "url": "https://my-project-feature-auth.test",
+  "db": "my_project_feature_auth",
+  "test_db": "test_my_project_feature_auth",
+  "herd": true
+}
+```
+
+`site`, `branch`, `path`, `base`, `dirty` and `ahead` (commits ahead of `base`) are always present. `url`, `db`, `test_db` and `herd` are omitted, never `null`, when they do not apply: no `.env`, no test database, Herd not installed.
+
+### `ws create <branch> --json`
+
+Streams NDJSON, one line per step, flushed as it happens:
+
+```
+{"step":"worktree","status":"running"}
+{"step":"worktree","status":"done"}
+{"step":"hooks","status":"done","message":"pre-create"}
+{"step":"env","status":"running"}
+...
+{"event":"ready","workspace":{ ...record... }}
+```
+
+Steps: `worktree`, `hooks` (`pre-create` / `post-create`), `env`, `deps`, `db`, `test_db`, `storage`, `herd`, `vite`, `caches`. A hard failure ends the stream with `{"event":"failed","step":"worktree","message":"..."}` and a non-zero exit code; provisioning steps that degrade gracefully (missing tool, DB clone fallback) stay `done` and explain themselves on stderr.
+
+### `ws finish <branch> --pr|--merge|--abandon --json`
+
+The mode flag replaces the menu and every prompt, with or without `--json`:
+
+- `--message <msg>` commits pending changes first (without it, uncommitted changes are a user error).
+- `--title <title>` sets the PR title (default: last commit subject); the body lists the commits.
+- `--cleanup` deletes the workspace afterwards (default: kept). `--abandon` always deletes it.
+
+Prints `{"event":"finished","mode":"pr","site":...,"branch":...,"base":...,"pr_url":"https://...","workspace_removed":false}`.
+
+### `ws destroy <branch> --yes --json`
+
+`--yes` is required in JSON mode. Prints `{"event":"destroyed","site":...,"branch":...}`.
 
 ## Integrations
 
