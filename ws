@@ -6,7 +6,7 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="3.0.2"
+VERSION="3.1.0"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
 MAX_LABEL_LEN=60
@@ -15,8 +15,11 @@ WS_OUT=1
 
 # Herd only exposes its binaries through ~/.zshrc, so non-interactive shells miss them
 HERD_BIN="$HOME/Library/Application Support/Herd/bin"
-if [[ -d "$HERD_BIN" ]] && ! command -v herd &>/dev/null; then
-    export PATH="$HERD_BIN:$PATH"
+if [[ -x "$HERD_BIN/herd" ]]; then
+    case ":$PATH:" in
+        *":$HERD_BIN:"*) ;;
+        *) export PATH="$HERD_BIN:$PATH" ;;
+    esac
 fi
 
 # ── Colors ──
@@ -341,6 +344,21 @@ _get_env_var() {
     grep "^${var}=" "$file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true
 }
 
+# pg_dump next to the psql binary itself (Herd's bin only links psql)
+_pg_dump_cmd() {
+    local psql_cmd real
+    psql_cmd="$(_psql_cmd)" || return 1
+    psql_cmd="$(command -v "$psql_cmd")" || return 1
+    real="$(readlink -f "$psql_cmd" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$psql_cmd" 2>/dev/null || echo "$psql_cmd")"
+    if [[ -x "$(dirname "$real")/pg_dump" ]]; then
+        echo "$(dirname "$real")/pg_dump"
+    elif command -v pg_dump &>/dev/null; then
+        echo "pg_dump"
+    else
+        return 1
+    fi
+}
+
 _psql_cmd() {
     if command -v psql &>/dev/null; then
         echo "psql"
@@ -524,29 +542,67 @@ _run_hook() {
 PROFILE_LARAVEL="laravel-herd"
 PROFILE_PLAIN="plain"
 
-# Profile of a project: --plain flag, then .ws.json "profile", then detection
-# (artisan + herd in PATH → laravel-herd, otherwise plain). Exported as WS_PROFILE.
+# The profile a workspace was provisioned with, kept next to its base branch
+_set_ws_profile() {
+    local repo="$1" branch="$2" profile="$3"
+    [[ -n "$branch" ]] || return 0
+    git -C "$repo" config "branch.${branch}.ws-profile" "$profile" 2>/dev/null || true
+}
+
+_get_ws_profile() {
+    local repo="$1" branch="$2"
+    [[ -n "$branch" ]] || return 0
+    git -C "$repo" config --get "branch.${branch}.ws-profile" 2>/dev/null || true
+}
+
+_valid_profile() {
+    [[ "$1" == "$PROFILE_LARAVEL" || "$1" == "$PROFILE_PLAIN" ]]
+}
+
+# Warn once per run when .ws.json exists but cannot be parsed (its keys are otherwise silently ignored).
+# Written to stderr explicitly: callers capture resolve_profile with $(...).
+WS_CONFIG_CHECKED=""
+_ws_config_check() {
+    local config="$1/.ws.json"
+    [[ -z "$WS_CONFIG_CHECKED" && -f "$config" ]] || return 0
+    WS_CONFIG_CHECKED="1"
+    if command -v jq &>/dev/null; then
+        jq -e . "$config" >/dev/null 2>&1 || warn ".ws.json is not valid JSON — ignored" >&2
+    elif command -v python3 &>/dev/null; then
+        python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$config" 2>/dev/null || warn ".ws.json is not valid JSON — ignored" >&2
+    fi
+}
+
+# resolve_profile <root> [flag] [branch]: --plain flag, then the profile stored for <branch>,
+# then .ws.json "profile", then detection (artisan → laravel-herd, otherwise plain).
+# Unknown values fall back to detection with a warning. Exported as WS_PROFILE.
 resolve_profile() {
-    local root="${1:-}" flag="${2:-}"
-    local profile="$flag"
-    [[ -z "$profile" && -n "$root" ]] && profile="$(_ws_config_get "$root" "profile")"
+    local root="${1:-}" flag="${2:-}" branch="${3:-}"
+    local profile="$flag" source="flag"
+    [[ -z "$root" ]] || _ws_config_check "$root"
+    if [[ -z "$profile" && -n "$root" ]]; then
+        profile="$(_get_ws_profile "$root" "$branch")"; source="branch.${branch}.ws-profile"
+    fi
+    if [[ -z "$profile" && -n "$root" ]]; then
+        profile="$(_ws_config_get "$root" "profile")"; source=".ws.json"
+    fi
+    if [[ -n "$profile" ]] && ! _valid_profile "$profile"; then
+        warn "Unknown profile '$profile' in $source (laravel-herd|plain) — detecting instead" >&2
+        profile=""
+    fi
     if [[ -z "$profile" ]]; then
-        if [[ -n "$root" && -f "$root/artisan" ]] && command -v herd &>/dev/null; then
+        if [[ -n "$root" && -f "$root/artisan" ]]; then
             profile="$PROFILE_LARAVEL"
         else
             profile="$PROFILE_PLAIN"
         fi
     fi
-    case "$profile" in
-        "$PROFILE_LARAVEL"|"$PROFILE_PLAIN") ;;
-        *) fail "Unknown profile '$profile' (laravel-herd|plain)" ;;
-    esac
     export WS_PROFILE="$profile"
     echo "$profile"
 }
 
 _profile_is_plain() {
-    [[ "${1:-$WS_PROFILE}" == "$PROFILE_PLAIN" ]]
+    [[ "${1:-${WS_PROFILE:-}}" == "$PROFILE_PLAIN" ]]
 }
 
 # ── Workspace record (shared by status, info and JSON events) ──
@@ -575,7 +631,7 @@ _workspace_record() {
     WR_AHEAD="$(git -C "$dir" rev-list --count "$base_ref..HEAD" 2>/dev/null || echo 0)"
     [[ "$WR_AHEAD" =~ ^[0-9]+$ ]] || WR_AHEAD=0
     WR_URL="" WR_DB="" WR_TEST_DB="" WR_HERD=""
-    WR_PROFILE="$(resolve_profile "$root")"
+    WR_PROFILE="$(resolve_profile "$root" "" "$WR_BRANCH")"
     _profile_is_plain "$WR_PROFILE" && return 0
     if [[ -f "$dir/.env" ]]; then
         WR_URL="$(_get_env_var "$dir/.env" APP_URL)"
@@ -738,6 +794,9 @@ cmd_create() {
     local root
     root="$(find_project_root)"
     resolve_profile "$root" "$profile_flag" >/dev/null
+    if _profile_is_plain && [[ -n "$secure$fresh" ]]; then
+        warn "--secure and --fresh have no effect with the plain profile"
+    fi
 
     # PR checkout mode: ws create pr:123 → fetch pull/123/head into pr-123, then use it
     if [[ "$branch_name" =~ ^pr:([0-9]+)$ ]]; then
@@ -863,7 +922,10 @@ cmd_setup() {
         sname="$(_truncate_label "$(slugify "$(basename "$wt_path")")")"
     fi
 
-    resolve_profile "${source_root:-$wt_path}" "$profile_flag" >/dev/null
+    resolve_profile "${source_root:-$wt_path}" "$profile_flag" "$branch_name" >/dev/null
+    if _profile_is_plain && [[ -n "$secure$fresh" ]]; then
+        warn "--secure and --fresh have no effect with the plain profile"
+    fi
     header "Provisioning workspace: $sname ($WS_PROFILE)"
     [[ -n "$source_root" ]] && info "Source: $source_root"
 
@@ -907,6 +969,7 @@ _provision() {
     export WS_URL=""
     _profile_is_plain || export WS_URL="${proto}://${sname}.test"
     export WS_ROOT="$root"
+    _set_ws_profile "${root:-$wt_path}" "$branch_name" "$WS_PROFILE"
 
     cd "$wt_path"
     emit_step hooks running "pre-create"
@@ -1112,9 +1175,10 @@ _setup_agent_files() {
     for f in .claude/settings.local.json CLAUDE.local.md; do
         if [[ -f "$root/$f" && ! -f "$f" ]]; then
             mkdir -p "$(dirname "$f")"
-            cp "$root/$f" "$f" && success "$f copied from main project"
+            cp "$root/$f" "$f" && success "$f copied from main project" || warn "$f could not be copied"
         fi
     done
+    return 0
 }
 
 # Symlink the gitignored files listed in .ws.json "files" to the main checkout
@@ -1137,11 +1201,18 @@ _setup_local_files() {
             warn "files: $f not found in main project — skipped"
             continue
         fi
+        local ignored=0
+        git -C "$root" check-ignore -q -- "$f" 2>/dev/null || ignored=$?
+        if (( ignored == 1 )); then
+            warn "files: $f is not gitignored (the link would show as an untracked change) — skipped"
+            continue
+        fi
         [[ -e "$f" || -L "$f" ]] && continue
-        mkdir -p "$(dirname "$f")"
+        mkdir -p "$(dirname "$f")" 2>/dev/null || { warn "files: could not create $(dirname "$f")"; continue; }
         target="$(_relative_path "$root/$f" "$(cd "$(dirname "$f")" && pwd)")"
-        ln -s "$target" "$f" && success "$f linked to main project"
+        ln -s "$target" "$f" && success "$f linked to main project" || warn "files: could not link $f"
     done < <(_ws_config_files "$root")
+    return 0
 }
 
 # Files and directories ws writes or clones per workspace: linking them would edit the main project
@@ -1274,17 +1345,13 @@ _setup_database() {
             ;;
         pgsql)
             local psql_cmd=""
-            if command -v psql &>/dev/null; then
-                psql_cmd="psql"
-            elif [[ -x "$HOME/Library/Application Support/Herd/bin/psql" ]]; then
-                psql_cmd="$HOME/Library/Application Support/Herd/bin/psql"
-            fi
+            psql_cmd="$(_psql_cmd)" || psql_cmd=""
 
             if [[ -n "$psql_cmd" ]]; then
                 local -a psql_args=(-q -U "$db_user" -h "$db_host")
                 [[ -n "${db_port:-}" ]] && psql_args+=(-p "$db_port")
-                local pg_dump_cmd="${psql_cmd%psql}pg_dump"
-                command -v "$pg_dump_cmd" &>/dev/null || pg_dump_cmd="pg_dump"
+                local pg_dump_cmd=""
+                pg_dump_cmd="$(_pg_dump_cmd)" || pg_dump_cmd=""
 
                 if [[ -z "$fresh" && "$workspace_db" != "$original_db" ]]; then
                     # TEMPLATE clone is instant but needs no active connections on the source
@@ -1295,7 +1362,9 @@ _setup_database() {
                     elif PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d postgres \
                         -c "CREATE DATABASE \"$workspace_db\";" 2>/dev/null; then
                         success "Database '$workspace_db' created (PostgreSQL)"
-                        if command -v "$pg_dump_cmd" &>/dev/null; then
+                        if [[ -z "$pg_dump_cmd" ]]; then
+                            warn "pg_dump not found — database left empty (migrations will run)"
+                        else
                             info "Cloning data from '$original_db' (pg_dump)..."
                             if PGPASSWORD="${db_pass:-}" "$pg_dump_cmd" -U "$db_user" -h "$db_host" ${db_port:+-p "$db_port"} "$original_db" 2>/dev/null \
                                 | PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -q -d "$workspace_db" >/dev/null 2>&1; then
@@ -1642,6 +1711,7 @@ cmd_open() {
 cmd_status() {
     local root
     root="$(find_project_root)"
+    _ws_config_check "$root"
     local wt_dir="$root/$WORKTREES_DIR"
 
     local -a sites=()
@@ -1709,6 +1779,7 @@ cmd_status() {
 cmd_info() {
     local root sname wt_path
     root="$(find_project_root)"
+    _ws_config_check "$root"
 
     if [[ -n "${1:-}" ]]; then
         sname="$(resolve_site_name "$1")"
@@ -1752,6 +1823,11 @@ cmd_preview() {
         fail "Usage: ws preview <branch-name> (or run from a worktree)"
     fi
 
+    local root
+    root="$(find_project_root)"
+    _workspace_record "$root" "$sname"
+    _profile_is_plain "$WR_PROFILE" && fail "Workspace '$sname' is plain: no Herd site to open."
+
     local proto
     proto="$(site_protocol "$sname")"
     local url="${proto}://$sname.test"
@@ -1793,6 +1869,7 @@ cmd_finish() {
     _is_live_worktree "$root" "$wt_path" || fail "Workspace '$sname' has no git worktree behind it (stale). Run: ws destroy $sname"
 
     wt_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
+    resolve_profile "$root" "" "$wt_branch" >/dev/null
 
     local base_branch
     base_branch="${into_flag:-$(_get_ws_base "$root" "$wt_branch")}"
@@ -2015,7 +2092,7 @@ _cleanup_workspace() {
     local sname="$1" wt_path="$2" wt_branch="$3" root="$4" keep_db="${5:-}"
 
     local profile
-    profile="$(resolve_profile "$root")"
+    profile="$(resolve_profile "$root" "" "$wt_branch")"
     if _profile_is_plain "$profile"; then
         keep_db="--keep-db"
     fi
@@ -2142,6 +2219,7 @@ cmd_destroy() {
         [[ "$confirm" =~ ^[yY]$ ]] || exit 0
     fi
 
+    resolve_profile "$root" "" "$wt_branch" >/dev/null
     export WS_PROJECT="$(basename "$root")"
     export WS_BRANCH="$wt_branch"
     export WS_SITE="$sname"
@@ -2206,6 +2284,7 @@ cmd_hook() {
                 wt_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
             fi
             cd "$root"
+            resolve_profile "$root" "" "$wt_branch" >/dev/null
             export WS_PROJECT="$(basename "$root")" WS_BRANCH="$wt_branch" WS_SITE="$sname" WS_DIR="$wt_path" WS_ROOT="$root"
             _run_hook "pre-destroy" "$root" >&2
             _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root" >&2
@@ -2284,7 +2363,8 @@ cmd_help() {
     echo -e "${BOLD}Hooks:${NC}"
     echo -e "  Drop executables in ${CYAN}.ws/hooks/${NC} at the repo root to run on lifecycle events:"
     echo -e "  ${DIM}pre-create, post-create, pre-destroy, post-finish${NC}"
-    echo -e "  Env available to hooks: ${DIM}WS_PROJECT, WS_BRANCH, WS_SITE, WS_DIR, WS_URL, WS_DB, WS_ROOT, WS_EVENT, WS_PROFILE${NC}"
+    echo -e "  Env available to hooks: ${DIM}WS_PROJECT, WS_BRANCH, WS_SITE, WS_DIR, WS_ROOT, WS_EVENT, WS_PROFILE,${NC}"
+    echo -e "                          ${DIM}WS_URL, WS_DB, WS_TEST_DB (create hooks), WS_BASE (post-finish)${NC}"
     echo ""
 }
 

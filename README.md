@@ -61,7 +61,7 @@ Then, inside any Claude Code session: `/workspace feat/auth` creates the workspa
 ## Prerequisites
 
 - **Git** (git worktree)
-- **Laravel Herd** installed (its `bin` directory is added to PATH automatically if missing, so `ws` also works from non-interactive shells)
+- **Laravel Herd** installed (its `bin` directory is put first on the PATH, as Herd's own shell setup does, so `ws` resolves the same `herd`, `php` and `psql` from non-interactive shells). Without Herd, a Laravel project still gets its `.env`, database and Vite port; only the site link is skipped
 - **Composer** and **npm**
 - An agent CLI in PATH — **Claude Code** (`claude`) by default, or any other (`codex`, `cursor-agent`, ...)
 - **jq** or **python3** (for `.ws.json`)
@@ -290,18 +290,19 @@ Drop executable scripts in `.ws/hooks/` at the repo root to run custom logic on 
 
 The following variables are exported to hooks:
 
-| Variable | Value |
-|---|---|
-| `WS_EVENT` | Hook name (`post-create`, `pre-destroy`, ...) |
-| `WS_PROJECT` | Main project name |
-| `WS_BRANCH` | Branch name |
-| `WS_SITE` | Slug used for the Herd site / worktree dir |
-| `WS_DIR` | Absolute path to the worktree |
-| `WS_URL` | Full URL (`http(s)://…test`) |
-| `WS_DB` | Workspace database name (if Laravel + DB detected) |
-| `WS_TEST_DB` | Workspace test database name (if a test DB was detected) |
-| `WS_ROOT` | Absolute path to the main repo |
-| `WS_BASE` | Base branch targeted by `ws finish` (`post-finish` only) |
+| Variable | Value | Available in |
+|---|---|---|
+| `WS_EVENT` | Hook name (`post-create`, `pre-destroy`, ...) | all |
+| `WS_PROJECT` | Main project name | all |
+| `WS_BRANCH` | Branch name | all |
+| `WS_SITE` | Slug used for the Herd site / worktree dir | all |
+| `WS_DIR` | Absolute path to the worktree (already removed when `post-finish` ran a cleanup) | all |
+| `WS_ROOT` | Absolute path to the main repo | all |
+| `WS_PROFILE` | `laravel-herd` or `plain` | all |
+| `WS_URL` | Full URL (`http(s)://…test`), empty for `plain` | `pre-create`, `post-create` |
+| `WS_DB` | Workspace database name (if Laravel + DB detected) | `post-create` |
+| `WS_TEST_DB` | Workspace test database name (if a test DB was detected) | `post-create` |
+| `WS_BASE` | Base branch targeted by `ws finish` | `post-finish` |
 
 Example `.ws/hooks/post-create`:
 
@@ -325,7 +326,7 @@ Don't forget `chmod +x .ws/hooks/post-create`. Hooks are optional — if a file 
 | `laravel-herd` | Everything described above: `.env` patched, dependencies cloned, database cloned, test database isolated, Herd link, Vite port, caches cleared |
 | `plain` | Worktree, `.env` copied as is when the main checkout has one, `vendor/` and `node_modules/` cloned copy-on-write when a lockfile is present, `.ws/hooks/` hooks. No database, no Herd, no Vite patch |
 
-The profile is resolved once per command: `--plain` flag (`ws create`, `ws setup`), then `"profile"` in `.ws.json`, then detection (`artisan` present and `herd` in the PATH → `laravel-herd`, otherwise `plain`). Hooks receive it as `WS_PROFILE`. `ws status`, `ws finish` and `ws destroy` follow the same rule, so a plain workspace is torn down without touching any database or Herd site, and its JSON record carries `"profile": "plain"` and none of the `url`, `db`, `test_db`, `herd` fields.
+The profile is resolved once per command: `--plain` flag (`ws create`, `ws setup`), then the profile the workspace was provisioned with (recorded in `git config branch.<name>.ws-profile`, next to its base branch), then `"profile"` in `.ws.json`, then detection (`artisan` present → `laravel-herd`, otherwise `plain`). An unknown value is reported and replaced by detection. Hooks receive it as `WS_PROFILE`. `ws status`, `ws finish` and `ws destroy` read the recorded profile, so a workspace created with `--plain` stays plain for its whole life: it is torn down without touching any database or Herd site, and its JSON record carries `"profile": "plain"` and none of the `url`, `db`, `test_db`, `herd` fields. `--secure` and `--fresh` are ignored, with a warning, for plain workspaces, and `ws preview` refuses them.
 
 ## Configuration (`.ws.json`)
 
@@ -351,7 +352,7 @@ Optional file at the repo root:
 | `terminal` | `tmux` \| `iterm` \| `terminal` \| `ghostty` \| `none` (default: auto). Env override: `WS_TERMINAL` |
 | `domain` | Env var holding the project's main host, patched to `<project>-<branch>.test` |
 | `subdomains` | Map of `prefix → env_var`. Each entry adds a `herd link` (`admin.<project>-<branch>.test`), patches the env var, is added to `SANCTUM_STATEFUL_DOMAINS`, and switches `SESSION_DOMAIN` to `.<project>-<branch>.test` so cookies span all hosts |
-| `files` | Gitignored files (relative to the repo root) symlinked from the main checkout into each workspace, so tooling that reads them by relative path (MCP servers, CLIs) keeps working. Existing files are left untouched; missing sources are skipped with a warning. Files `ws` provisions itself (`.env`, `.env.testing`, `phpunit.xml`, SQLite files, `storage`, `vendor`, `node_modules`) are refused |
+| `files` | Gitignored files (relative to the repo root) symlinked from the main checkout into each workspace, so tooling that reads them by relative path (MCP servers, CLIs) keeps working. Existing files are left untouched; missing sources and paths that are not gitignored are skipped with a warning. Files `ws` provisions itself (`.env`, `.env.testing`, `phpunit.xml`, SQLite files, `storage`, `vendor`, `node_modules`) are refused |
 
 With `--secure`, each subdomain is also passed through `herd secure`. `ws destroy` cleans up every subdomain link as long as `.ws.json` is still present at the repo root.
 
