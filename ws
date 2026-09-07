@@ -275,6 +275,26 @@ _ws_config_has_subdomains() {
     [[ -n "$(_ws_config_subdomains "$1")" ]]
 }
 
+# Emit one path per line from the .ws.json "files" array. Empty if absent.
+_ws_config_files() {
+    local root="$1"
+    local config="$root/.ws.json"
+    [[ -n "$root" && -f "$config" ]] || return 0
+    if command -v jq &>/dev/null; then
+        jq -r '(.files // []) | .[] | select(type == "string" and . != "")' "$config" 2>/dev/null || true
+    elif command -v python3 &>/dev/null; then
+        python3 - "$config" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    for f in (json.load(open(sys.argv[1])).get("files") or []):
+        if isinstance(f, str) and f:
+            print(f)
+except Exception:
+    pass
+PY
+    fi
+}
+
 # Set or replace VAR=value in an .env file
 _set_env_var() {
     local file="$1" var="$2" value="$3"
@@ -862,6 +882,7 @@ _provision() {
     emit_step env done
     emit_step deps running
     _setup_agent_files "$root"
+    _setup_local_files "$root"
     _setup_composer "$root"
     _setup_npm "$root"
     emit_step deps done
@@ -1055,6 +1076,37 @@ _setup_agent_files() {
             cp "$root/$f" "$f" && success "$f copied from main project"
         fi
     done
+}
+
+# Symlink the gitignored files listed in .ws.json "files" to the main checkout
+# (single source of truth for local secrets, nothing left behind on destroy)
+_setup_local_files() {
+    local root="$1"
+    [[ -n "$root" ]] || return 0
+    local f target
+    while IFS= read -r f; do
+        if [[ "$f" == /* || "$f" == ".." || "$f" == ../* || "$f" == */../* || "$f" == */.. ]]; then
+            warn "files: '$f' must be a path relative to the repo root — skipped"
+            continue
+        fi
+        if [[ ! -e "$root/$f" ]]; then
+            warn "files: $f not found in main project — skipped"
+            continue
+        fi
+        [[ -e "$f" || -L "$f" ]] && continue
+        mkdir -p "$(dirname "$f")"
+        target="$(_relative_path "$root/$f" "$(cd "$(dirname "$f")" && pwd)")"
+        ln -s "$target" "$f" && success "$f linked to main project"
+    done < <(_ws_config_files "$root")
+}
+
+# Path of <target> relative to <from_dir>; absolute when it cannot be computed
+_relative_path() {
+    local target="$1" from_dir="$2"
+    if command -v python3 &>/dev/null; then
+        python3 -c 'import os, sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$target" "$from_dir" 2>/dev/null && return 0
+    fi
+    echo "$target"
 }
 
 # Clone <dir> from root via CoW when missing locally, then sync if lockfiles differ
@@ -2160,7 +2212,9 @@ cmd_help() {
     echo ""
     echo -e "${BOLD}Config (.ws.json at repo root):${NC}"
     echo -e "  ${DIM}{ \"agent\": \"claude\", \"terminal\": \"iterm\", \"profile\": \"laravel-herd\",${NC}"
-    echo -e "  ${DIM}  \"domain\": \"APP_DOMAIN\", \"subdomains\": { \"admin\": \"FILAMENT_DOMAIN\" } }${NC}"
+    echo -e "  ${DIM}  \"domain\": \"APP_DOMAIN\", \"subdomains\": { \"admin\": \"FILAMENT_DOMAIN\" },${NC}"
+    echo -e "  ${DIM}  \"files\": [\"db-prod.toml\"] }${NC}"
+    echo -e "  files: ${DIM}gitignored files symlinked from the main checkout into each workspace${NC}"
     echo -e "  terminal: ${DIM}tmux | iterm | terminal | ghostty | none${NC} (auto-detected by default)"
     echo -e "  Env overrides: ${DIM}WS_AGENT, WS_TERMINAL, WS_SOURCE${NC}"
     echo ""

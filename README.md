@@ -99,6 +99,7 @@ Everything is handled automatically:
 - Isolates the test database (`test_myproject_feature_auth`): copies `.env.testing`, creates an empty DB, and points `phpunit.xml` at it so suites can run in parallel with the main repo without deadlocking
 - Clones `storage/app` (uploads) and runs `storage:link`
 - Copies `.claude/settings.local.json` and `CLAUDE.local.md` so agent permissions carry over
+- Symlinks the gitignored files listed under `"files"` in `.ws.json` (local MCP configs, credentials...) to the main checkout
 - Links with Herd → `http(s)://my-project-feature-auth.test`
 - Patches Vite config (`host: 'localhost'`, `cors: true`, `port: Number(process.env.VITE_PORT) || 5173`) — commit that change once on your base branch so future workspaces start clean
 - Clears Laravel caches
@@ -338,7 +339,8 @@ Optional file at the repo root:
   "subdomains": {
     "admin": "FILAMENT_DOMAIN",
     "api": "API_DOMAIN"
-  }
+  },
+  "files": ["db-prod.toml", ".mcp.local.json"]
 }
 ```
 
@@ -349,6 +351,7 @@ Optional file at the repo root:
 | `terminal` | `tmux` \| `iterm` \| `terminal` \| `ghostty` \| `none` (default: auto). Env override: `WS_TERMINAL` |
 | `domain` | Env var holding the project's main host, patched to `<project>-<branch>.test` |
 | `subdomains` | Map of `prefix → env_var`. Each entry adds a `herd link` (`admin.<project>-<branch>.test`), patches the env var, is added to `SANCTUM_STATEFUL_DOMAINS`, and switches `SESSION_DOMAIN` to `.<project>-<branch>.test` so cookies span all hosts |
+| `files` | Gitignored files (relative to the repo root) symlinked from the main checkout into each workspace, so tooling that reads them by relative path (MCP servers, CLIs) keeps working. Existing files are left untouched; missing sources are skipped with a warning |
 
 With `--secure`, each subdomain is also passed through `herd secure`. `ws destroy` cleans up every subdomain link as long as `.ws.json` is still present at the repo root.
 
