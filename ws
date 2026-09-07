@@ -6,12 +6,18 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="3.0.0"
+VERSION="3.0.1"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
 MAX_LABEL_LEN=60
 WS_JSON="${WS_JSON:-}"
 WS_OUT=1
+
+# Herd only exposes its binaries through ~/.zshrc, so non-interactive shells miss them
+HERD_BIN="$HOME/Library/Application Support/Herd/bin"
+if [[ -d "$HERD_BIN" ]] && ! command -v herd &>/dev/null; then
+    export PATH="$HERD_BIN:$PATH"
+fi
 
 # ── Colors ──
 RED='\033[0;31m'

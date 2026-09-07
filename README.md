@@ -61,7 +61,7 @@ Then, inside any Claude Code session: `/workspace feat/auth` creates the workspa
 ## Prerequisites
 
 - **Git** (git worktree)
-- **Laravel Herd** installed and in PATH
+- **Laravel Herd** installed (its `bin` directory is added to PATH automatically if missing, so `ws` also works from non-interactive shells)
 - **Composer** and **npm**
 - An agent CLI in PATH — **Claude Code** (`claude`) by default, or any other (`codex`, `cursor-agent`, ...)
 - **jq** or **python3** (for `.ws.json`)
