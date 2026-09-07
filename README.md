@@ -95,7 +95,7 @@ Everything is handled automatically:
 - Assigns a unique `VITE_PORT` (deterministic per branch, avoids `npm run dev` collisions)
 - Namespaces shared services: `CACHE_PREFIX` / `REDIS_PREFIX` (when Redis or Memcached is used), `HORIZON_PREFIX`, `SCOUT_PREFIX`
 - Clones `vendor/` and `node_modules/` from the main project with copy-on-write, then syncs only if the lockfile differs
-- Clones the database (`myproject_feature_auth`) from the main one — PostgreSQL `TEMPLATE`, `mysqldump`, or SQLite file copy — then runs migrations. `--fresh` creates an empty DB and runs migrations + seeders instead
+- Clones the database (`myproject_feature_auth`) from the main one — PostgreSQL `TEMPLATE`, `mysqldump`, or SQLite file copy — then runs migrations. `--fresh` creates an empty DB and runs migrations + seeders instead. A database that already exists under that name is kept as is (migrations only). SQLite keeps `DB_DATABASE` untouched: the file (default `database/database.sqlite`, relative to the worktree) is copied, an absolute path is left alone
 - Isolates the test database (`test_myproject_feature_auth`): copies `.env.testing`, creates an empty DB, and points `phpunit.xml` at it so suites can run in parallel with the main repo without deadlocking
 - Clones `storage/app` (uploads) and runs `storage:link`
 - Copies `.claude/settings.local.json` and `CLAUDE.local.md` so agent permissions carry over
@@ -182,7 +182,7 @@ ws destroy feature/auth --keep-db    # keeps the database
 ws destroy feature/auth --yes        # no confirmation prompt
 ```
 
-Deletes the worktree, local branch, database, Herd link(s), and SSL certificate if applicable. Use `--keep-db` to keep the database. Only databases named `<main database>_…` (the names `ws` creates) are ever dropped; a workspace `.env` pointing anywhere else is left alone. A stale directory (no git worktree behind it) is removed without touching any branch.
+Deletes the worktree, local branch, database, Herd link(s), and SSL certificate if applicable. Use `--keep-db` to keep the database. Only databases named `<main database>_…` (the names `ws` creates) are ever dropped; a workspace `.env` pointing anywhere else is left alone. A stale directory (no git worktree behind it) is removed without touching any branch. Uncommitted changes in the worktree are listed in the confirmation and lost with it.
 
 ## Machine-readable output (`--json`)
 
@@ -224,7 +224,7 @@ Streams NDJSON, one line per step, flushed as it happens:
 {"event":"ready","workspace":{ ...record... }}
 ```
 
-Steps: `worktree`, `hooks` (`pre-create` / `post-create`), `env`, `deps`, `db`, `test_db`, `storage`, `herd`, `vite`, `caches`. A hard failure ends the stream with `{"event":"failed","step":"worktree","message":"..."}` and a non-zero exit code; provisioning steps that degrade gracefully (missing tool, DB clone fallback) stay `done` and explain themselves on stderr.
+Steps: `worktree`, `hooks` (`pre-create` / `post-create`), `env`, `deps`, `db`, `test_db`, `storage`, `herd`, `vite`, `caches`. A hard failure ends the stream with `{"event":"failed","step":"<step>","message":"..."}` and a non-zero exit code, whichever step it happens in; once the worktree exists the message names the `ws destroy` command that cleans it up. Provisioning steps that degrade gracefully (missing tool, DB clone fallback) stay `done` and explain themselves on stderr.
 
 ### `ws finish <branch> --pr|--merge|--abandon --json`
 
@@ -365,6 +365,8 @@ Herd sites use the format `project-branch.test` to avoid conflicts between proje
 | `my-app` | `feature/login` | `my-app-feature-login.test` |
 | `other-app` | `feature/login` | `other-app-feature-login.test` |
 
+`/` and `_` both become `-`, so `feature/login` and `feature_login` name the same workspace and the second `ws create` is refused. Database names use `_` instead (`my_app_feature_login`).
+
 ## Structure
 
 ```
@@ -412,7 +414,7 @@ Two suites are sharing one database. `ws` isolates the test DB per workspace, bu
 `phpunit.xml` is tracked by git, so `ws` patches it in the worktree and flags it `--skip-worktree`: the change never shows up in `git status`, diffs, or commits. If an upstream change to `phpunit.xml` later blocks a pull or checkout in that worktree, lift the flag with `git update-index --no-skip-worktree phpunit.xml`.
 
 ### Blank page / CORS errors
-Check that `vite.config.js` has `host: 'localhost'` and `cors: true`. Kill existing Vite processes: `pkill -f "node.*vite"`.
+Check that `vite.config.js` has `host: 'localhost'` and `cors: true`. `ws` patches the workspace copy and marks it `skip-worktree`, like `phpunit.xml`, so the patch never shows in `git status` nor lands in a commit; apply the same change on your base branch once. Kill existing Vite processes: `pkill -f "node.*vite"`.
 
 ### Mixed Content (HTTPS)
 If the site is secured with Herd, make sure `APP_URL` is `https://`. Use `ws create <branch> --secure`.

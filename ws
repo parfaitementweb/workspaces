@@ -6,7 +6,7 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="3.1.0"
+VERSION="3.2.0"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
 MAX_LABEL_LEN=60
@@ -66,7 +66,9 @@ _json_str() {
 }
 
 # One NDJSON progress line per step, JSON mode only
+CURRENT_STEP=""
 emit_step() {
+    CURRENT_STEP="$1"
     [[ -n "$WS_JSON" ]] || return 0
     local name="$1" status="$2" message="${3:-}"
     if [[ -n "$message" ]]; then
@@ -104,7 +106,7 @@ project_name() {
 
 # Clean slug for branch name (feature/auth → feature-auth)
 slugify() {
-    echo "$1" | sed 's/[\/]/-/g' | sed 's/[^a-zA-Z0-9._-]/-/g' | tr '[:upper:]' '[:lower:]'
+    echo "$1" | sed 's/[\/_]/-/g' | sed 's/[^a-zA-Z0-9.-]/-/g' | tr '[:upper:]' '[:lower:]'
 }
 
 # Short deterministic hash of a string (6 hex chars)
@@ -182,11 +184,16 @@ detect_current_worktree() {
 }
 
 # Detect the default branch (main, master, develop...)
+DEFAULT_BRANCH_CACHE="" DEFAULT_BRANCH_CACHE_ROOT=""
 detect_default_branch() {
     local root
     root="$(find_project_root)"
+    if [[ -n "$DEFAULT_BRANCH_CACHE" && "$DEFAULT_BRANCH_CACHE_ROOT" == "$root" ]]; then
+        echo "$DEFAULT_BRANCH_CACHE"
+        return 0
+    fi
     local branch
-    branch=$(git -C "$root" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+    branch=$(git -C "$root" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || true)
     if [[ -z "$branch" ]]; then
         if git -C "$root" show-ref --verify --quiet refs/heads/main 2>/dev/null; then
             branch="main"
@@ -196,6 +203,7 @@ detect_default_branch() {
             branch="main"
         fi
     fi
+    DEFAULT_BRANCH_CACHE="$branch" DEFAULT_BRANCH_CACHE_ROOT="$root"
     echo "$branch"
 }
 
@@ -239,11 +247,22 @@ site_protocol() {
 }
 
 # Exact-match check against `herd links` output (avoids feat-auth matching feat-auth-2)
+# `herd links` spawns a PHP process: read it once per invocation, drop the cache after link/unlink
+HERD_LINKS_CACHE="" HERD_LINKS_LOADED=""
+_herd_links() {
+    if [[ -z "$HERD_LINKS_LOADED" ]]; then
+        HERD_LINKS_CACHE="$(herd links 2>/dev/null || true)"
+        HERD_LINKS_LOADED="1"
+    fi
+    printf '%s\n' "$HERD_LINKS_CACHE"
+}
+_herd_links_reset() { HERD_LINKS_LOADED=""; }
+
 _herd_linked() {
     local name="$1" escaped
     escaped="$(printf '%s' "$name" | sed 's/\./\\./g')"
     command -v herd &>/dev/null || return 1
-    herd links 2>/dev/null | grep -qE "(^|[[:space:]|])${escaped}([[:space:]|]|\.test|$)"
+    grep -qE "(^|[[:space:]|])${escaped}([[:space:]|]|\.test|$)" <<<"$(_herd_links)"
 }
 
 # Deterministic Vite port per workspace (5173..6172) based on site slug
@@ -281,7 +300,17 @@ _ws_config_domain_env() {
 }
 
 # Emit "<prefix>:<ENV_VAR>" lines from .ws.json subdomains map. Empty if absent.
+SUBDOMAINS_CACHE="" SUBDOMAINS_CACHE_ROOT=""
 _ws_config_subdomains() {
+    local root="$1"
+    if [[ -n "$SUBDOMAINS_CACHE_ROOT" && "$SUBDOMAINS_CACHE_ROOT" == "$root" ]]; then
+        printf '%s' "$SUBDOMAINS_CACHE"
+        return 0
+    fi
+    SUBDOMAINS_CACHE="$(_ws_config_subdomains_read "$root")" SUBDOMAINS_CACHE_ROOT="$root"
+    printf '%s' "$SUBDOMAINS_CACHE"
+}
+_ws_config_subdomains_read() {
     local root="$1"
     local config="$root/.ws.json"
     [[ -n "$root" && -f "$config" ]] || return 0
@@ -793,6 +822,7 @@ cmd_create() {
 
     local root
     root="$(find_project_root)"
+    trap _on_provision_exit EXIT
     resolve_profile "$root" "$profile_flag" >/dev/null
     if _profile_is_plain && [[ -n "$secure$fresh" ]]; then
         warn "--secure and --fresh have no effect with the plain profile"
@@ -848,8 +878,10 @@ cmd_create() {
     fi
     success "Worktree created: $wt_path"
     emit_step worktree done
+    WS_CREATED_SITE="$sname"
 
     _provision "$root" "$branch_name" "$sname" "$wt_path" "$secure" "$fresh"
+    WS_DONE="1"
     if [[ -n "$WS_JSON" ]]; then
         _workspace_record "$root" "$sname"
         emit_event ready "\"workspace\":$(_workspace_json)"
@@ -866,9 +898,23 @@ cmd_create() {
 
 # <step> <message> <exit-code>: report a hard failure of ws create in both output modes
 _create_failed() {
+    WS_DONE="1"
     emit_event failed "\"step\":$(_json_str "$1"),\"message\":$(_json_str "$2")"
     error "$2"
     exit "${3:-1}"
+}
+
+# Armed by create/setup: an errexit death mid-provisioning still closes the stream with a
+# failed event and tells how to clean up. Command substitutions never run this trap.
+WS_DONE="" WS_CREATED_SITE=""
+_on_provision_exit() {
+    local code=$?
+    [[ -z "$WS_DONE" && "$code" -ne 0 ]] || exit "$code"
+    local step="${CURRENT_STEP:-provision}" hint=""
+    [[ -z "$WS_CREATED_SITE" ]] || hint=" — run: ws destroy $WS_CREATED_SITE"
+    emit_event failed "\"step\":$(_json_str "$step"),\"message\":$(_json_str "Provisioning stopped during step '$step' (exit $code)$hint")"
+    error "Provisioning stopped during step '$step'$hint"
+    exit "$code"
 }
 
 # ── SETUP (provision the current directory as a workspace) ──
@@ -929,7 +975,9 @@ cmd_setup() {
     header "Provisioning workspace: $sname ($WS_PROFILE)"
     [[ -n "$source_root" ]] && info "Source: $source_root"
 
+    trap _on_provision_exit EXIT
     _provision "$source_root" "$branch_name" "$sname" "$wt_path" "$secure" "$fresh"
+    WS_DONE="1"
     if [[ -n "$WS_JSON" ]]; then
         emit_event ready "\"site\":$(_json_str "$sname"),\"branch\":$(_json_str "$branch_name"),\"path\":$(_json_str "$wt_path")"
     else
@@ -1298,8 +1346,21 @@ _setup_database() {
     local source_env="${root:+$root/.env}"
     [[ -z "$source_env" || ! -f "$source_env" ]] && source_env=".env"
 
-    local original_db
+    local original_db db_connection cloned=""
     original_db="$(_get_env_var "$source_env" DB_DATABASE)"
+    db_connection="$(_get_env_var .env DB_CONNECTION)"
+
+    if [[ "$db_connection" == "sqlite" ]]; then
+        local rc=0
+        _setup_sqlite_database "$root" "$fresh" "$original_db" || rc=$?
+        case "$rc" in
+            0) cloned="1" ;;
+            2) return 0 ;;
+        esac
+        _run_migrations "$cloned"
+        return 0
+    fi
+
     [[ -n "$original_db" ]] || return 0
 
     local workspace_db
@@ -1308,8 +1369,7 @@ _setup_database() {
     _set_env_var .env DB_DATABASE "$workspace_db"
     export WS_DB="$workspace_db"
 
-    local db_connection db_user db_pass db_host db_port
-    db_connection="$(_get_env_var .env DB_CONNECTION)"
+    local db_user db_pass db_host db_port
     db_user="$(_get_env_var .env DB_USERNAME)"
     db_pass="$(_get_env_var .env DB_PASSWORD)"
     db_host="$(_get_env_var .env DB_HOST)"
@@ -1317,7 +1377,12 @@ _setup_database() {
     db_user="${db_user:-root}"
     db_host="${db_host:-127.0.0.1}"
 
-    local cloned=""
+    # An existing database is somebody's data (a re-run, or another workspace): never clone over it
+    if _db_exists "$db_connection" "$workspace_db" "$db_user" "$db_pass" "$db_host" "$db_port"; then
+        warn "Database '$workspace_db' already exists — kept as is (no clone, no seed)"
+        _run_migrations "1"
+        return 0
+    fi
 
     case "${db_connection:-}" in
         mysql|mariadb)
@@ -1400,21 +1465,14 @@ _setup_database() {
                 warn "psql not found — create PostgreSQL database manually"
             fi
             ;;
-        sqlite)
-            local db_path="database/database.sqlite"
-            if [[ ! -f "$db_path" ]]; then
-                if [[ -z "$fresh" && -n "$root" && -f "$root/$db_path" ]]; then
-                    cp -c "$root/$db_path" "$db_path" 2>/dev/null || cp "$root/$db_path" "$db_path"
-                    success "SQLite database cloned from main project"
-                    cloned="1"
-                else
-                    touch "$db_path"
-                    success "SQLite file created"
-                fi
-            fi
-            ;;
     esac
 
+    _run_migrations "$cloned"
+}
+
+# <cloned>: seeders only run on a database that did not come from a clone
+_run_migrations() {
+    local cloned="${1:-}"
     info "Running migrations..."
     if php artisan migrate --force --quiet --no-interaction 2>/dev/null; then
         success "Migrations done"
@@ -1430,6 +1488,53 @@ _setup_database() {
             warn "Seeders failed — do it manually"
         fi
     fi
+}
+
+# SQLite keeps DB_DATABASE untouched: the file path is the isolation. Returns 0 when the
+# workspace has data (cloned or pre-existing), 1 when the file was created empty, 2 to skip
+# migrations altogether (in-memory, or an absolute path shared with the main project).
+_setup_sqlite_database() {
+    local root="$1" fresh="$2" db_path="${3:-database/database.sqlite}"
+    [[ "$db_path" != ":memory:" ]] || return 2
+    if [[ "$db_path" == /* ]]; then
+        warn "SQLite database is an absolute path ($db_path) shared with the main project — not isolated, left untouched"
+        return 2
+    fi
+    export WS_DB="$db_path"
+    [[ ! -f "$db_path" ]] || { info "SQLite database already present — kept"; return 0; }
+    mkdir -p "$(dirname "$db_path")" 2>/dev/null || true
+    if [[ -z "$fresh" && -n "$root" && -f "$root/$db_path" ]]; then
+        if cp -c "$root/$db_path" "$db_path" 2>/dev/null || cp "$root/$db_path" "$db_path" 2>/dev/null; then
+            success "SQLite database cloned from main project"
+            return 0
+        fi
+        warn "Could not clone the SQLite database — starting empty"
+    fi
+    touch "$db_path" 2>/dev/null || { warn "Could not create $db_path"; return 2; }
+    success "SQLite file created"
+    return 1
+}
+
+# True when the database already exists on the server (MySQL/MariaDB/PostgreSQL)
+_db_exists() {
+    local conn="$1" name="$2" user="${3:-root}" pass="${4:-}" host="${5:-127.0.0.1}" port="${6:-}"
+    case "$conn" in
+        mysql|mariadb)
+            command -v mysql &>/dev/null || return 1
+            local out
+            out="$(mysql -u"$user" ${pass:+-p"$pass"} -h"$host" ${port:+-P"$port"} -N -e "SHOW DATABASES LIKE '$name';" 2>/dev/null || true)"
+            [[ -n "$out" ]]
+            ;;
+        pgsql)
+            local psql_cmd
+            psql_cmd="$(_psql_cmd)" || return 1
+            local -a psql_args=(-q -U "$user" -h "$host")
+            [[ -n "$port" ]] && psql_args+=(-p "$port")
+            PGPASSWORD="$pass" "$psql_cmd" "${psql_args[@]}" -d postgres -tAc \
+                "SELECT 1 FROM pg_database WHERE datname='$name';" 2>/dev/null | grep -q 1
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 _setup_test_database() {
@@ -1480,14 +1585,13 @@ _setup_test_database() {
         _set_phpunit_env "$phpunit_file" DB_DATABASE "$workspace_test_db"
         # PHPUnit env entries win over .env.testing, so the tracked file must be
         # patched; skip-worktree keeps that edit out of every diff and commit
-        if git ls-files --error-unmatch "$phpunit_file" &>/dev/null; then
-            git update-index --skip-worktree "$phpunit_file" 2>/dev/null || true
-        fi
+        _skip_worktree "$phpunit_file"
         success "$(basename "$phpunit_file") → $workspace_test_db"
     fi
 
     if [[ -f ".env.testing" ]]; then
         _set_env_var .env.testing DB_DATABASE "$workspace_test_db"
+        _skip_worktree .env.testing
     fi
 
     export WS_TEST_DB="$workspace_test_db"
@@ -1526,6 +1630,7 @@ _setup_herd() {
     fi
 
     info "Linking with Herd..."
+    _herd_links_reset
     (cd "$wt_path" && herd link "$sname") 2>/dev/null && \
         success "Herd link: $sname.test" || \
         { warn "Herd link failed — do it manually"; return 0; }
@@ -1581,8 +1686,15 @@ _setup_vite() {
     fi
 
     if [[ -n "$patched" ]]; then
-        warn "$vite_config was patched in this workspace — commit the same change on your base branch once so future workspaces start clean"
+        _skip_worktree "$vite_config"
+        warn "$vite_config was patched in this workspace (kept out of diffs and commits) — apply the same change on your base branch once so future workspaces start clean"
     fi
+}
+
+# Keep a per-workspace edit of a tracked file out of status, diffs and `git add -A`
+_skip_worktree() {
+    git ls-files --error-unmatch "$1" &>/dev/null || return 0
+    git update-index --skip-worktree "$1" 2>/dev/null || true
 }
 
 _clear_cache() {
@@ -1932,8 +2044,8 @@ _finish_commit_changes() {
         echo ""
         read -rp "Commit message: " commit_msg
     fi
-    git -C "$wt_path" add -A
-    git -C "$wt_path" commit -m "$commit_msg"
+    git -C "$wt_path" add -A || fail "Could not stage changes in '$sname'"
+    git -C "$wt_path" commit -m "$commit_msg" || fail "Commit failed in '$sname' (git hooks or identity?)"
     success "Changes committed"
 }
 
@@ -1982,7 +2094,11 @@ _finish_pr() {
         fi
 
         case "$desc_choice" in
-            2) pr_body=$(git log "$base_branch..$wt_branch" --pretty=format:"- %s" 2>/dev/null) ;;
+            2)
+                local base_ref
+                base_ref="$(_resolve_start_point "$root" "$base_branch" 2>/dev/null || echo "$base_branch")"
+                pr_body=$(git log "$base_ref..$wt_branch" --pretty=format:"- %s" 2>/dev/null || true)
+                ;;
             *) pr_body="" ;;
         esac
 
@@ -2097,14 +2213,16 @@ _cleanup_workspace() {
         keep_db="--keep-db"
     fi
 
-    local vite_pids
-    vite_pids=$(pgrep -f "node.*vite.*${sname}" 2>/dev/null || true)
+    local vite_pids escaped
+    escaped="$(printf '%s' "$sname" | sed 's/\./\\./g')"
+    vite_pids=$(pgrep -f "/${WORKTREES_DIR#.}/${escaped}/.*vite" 2>/dev/null || true)
     if [[ -n "$vite_pids" ]]; then
         echo "$vite_pids" | xargs kill 2>/dev/null || true
         success "Vite processes killed"
     fi
 
     if ! _profile_is_plain "$profile" && command -v herd &>/dev/null; then
+        _herd_links_reset
         herd unsecure "$sname" 2>/dev/null || true
         herd unlink "$sname" 2>/dev/null && \
             success "Herd unlink: $sname" || true
@@ -2211,6 +2329,9 @@ cmd_destroy() {
         _out "  Branch:   ? ${DIM}(stale: no git worktree behind it)${NC}"
     else
         _out "  Branch:   $wt_branch"
+        if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
+            _out "  ${YELLOW}Uncommitted changes will be lost${NC}"
+        fi
     fi
     [[ -z "$keep_db" ]] || _out "  ${DIM}(database kept)${NC}"
     _out ""
