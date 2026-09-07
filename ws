@@ -1520,7 +1520,7 @@ _setup_database() {
                             warn "pg_dump not found — database left empty (migrations will run)"
                         else
                             info "Cloning data from '$original_db' (pg_dump)..."
-                            if PGPASSWORD="${db_pass:-}" "$pg_dump_cmd" -U "$db_user" -h "$db_host" ${db_port:+-p "$db_port"} "$original_db" 2>/dev/null \
+                            if PGPASSWORD="${db_pass:-}" "$pg_dump_cmd" --no-owner --no-privileges -U "$db_user" -h "$db_host" ${db_port:+-p "$db_port"} "$original_db" 2>/dev/null \
                                 | PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -q -v ON_ERROR_STOP=1 --single-transaction -d "$workspace_db" >/dev/null 2>&1; then
                                 success "Database cloned from '$original_db'"
                                 cloned="1"
@@ -1610,7 +1610,7 @@ _db_exists() {
         mysql|mariadb)
             command -v mysql &>/dev/null || return 1
             local out
-            out="$(MYSQL_PWD="$pass" mysql -u"$user" -h"$host" ${port:+-P"$port"} -N -e "SHOW DATABASES LIKE '$name';" 2>/dev/null || true)"
+            out="$(MYSQL_PWD="$pass" mysql -u"$user" -h"$host" ${port:+-P"$port"} -N -e "SHOW DATABASES LIKE '$(printf '%s' "$name" | sed 's/[_%]/\\&/g')';" 2>/dev/null || true)"
             [[ -n "$out" ]]
             ;;
         pgsql)
@@ -2294,9 +2294,10 @@ _cleanup_workspace() {
         keep_db="--keep-db"
     fi
 
-    local vite_pids escaped
+    local vite_pids escaped escaped_dir
     escaped="$(printf '%s' "$sname" | sed 's/\./\\./g')"
-    vite_pids=$(pgrep -f "/${WORKTREES_DIR#.}/${escaped}/.*vite" 2>/dev/null || true)
+    escaped_dir="$(printf '%s' "$WORKTREES_DIR" | sed 's/\./\\./g')"
+    vite_pids=$(pgrep -f "/${escaped_dir}/${escaped}/.*vite" 2>/dev/null || true)
     if [[ -n "$vite_pids" ]]; then
         echo "$vite_pids" | xargs kill 2>/dev/null || true
         success "Vite processes killed"
