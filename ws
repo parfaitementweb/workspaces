@@ -6,7 +6,7 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="3.3.0"
+VERSION="3.3.1"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
 MAX_LABEL_LEN=60
@@ -1684,13 +1684,14 @@ _setup_storage() {
     local root="$1" fresh="${2:-}"
     [[ -f "artisan" ]] || return 0
 
-    local marker="storage/.ws-storage-cloned"
+    local marker="storage/app/.ws-cloned"
+    [[ -f "storage/.ws-storage-cloned" && -d "storage/app" ]] && mv "storage/.ws-storage-cloned" "$marker"
     if [[ -f "$marker" && "$fresh" != "--fresh" ]]; then
         info "storage/app already cloned — kept"
     elif [[ -n "$root" && -d "$root/storage/app" ]]; then
         local tmp
         tmp="$(mktemp -d storage/.app.ws-XXXXXX)" || { warn "Could not create a temporary directory in storage/"; return 0; }
-        if _cow_copy "$root/storage/app" "$tmp"; then
+        if _cow_copy "$root/storage/app/." "$tmp"; then
             rm -rf storage/app && mv "$tmp" storage/app && touch "$marker"
             success "storage/app cloned from main project"
         else

@@ -460,6 +460,7 @@ Only Redis and Memcached are namespaced automatically. If you use another shared
 
 ## Changelog
 
+- **3.3.1** — `storage/app` is cloned flat again (3.3.0 nested it under `storage/app/app` and dropped the tracked `.gitignore` files); the clone marker moves to `storage/app/.ws-cloned` so it no longer shows up as untracked.
 - **3.3.0** — `.` is slugified like `/` and `_`; `--from origin/<branch>` records its base and sets no upstream; `create pr:N` refreshes a force-pushed PR; `finish --abandon` deletes the branch; `finish` refuses a detached HEAD; `setup` re-runs keep `.env`, `storage/app` and the database name; a separate repository under `.worktrees/` is never removed; MySQL passwords go through `MYSQL_PWD`; database and push failures name their cause; `sed` edits are portable and escape their values; JSON output escapes every control character.
 - **3.2.0** — `create`/`setup` close their stream with a `failed` event on any hard failure; existing databases are never cloned over; SQLite keeps `DB_DATABASE` and clones the file; `_` and `-` name the same workspace; Vite and `.env.testing` patches are `skip-worktree`; `destroy` lists uncommitted changes; `herd links` read once per command.
 - **3.1.0** — The profile is recorded per workspace (`branch.<name>.ws-profile`) and wins over `.ws.json`; detection needs `artisan` only; unknown profiles and invalid `.ws.json` warn instead of failing; `"files"` entries must be gitignored; `WS_PROFILE` reaches every hook; `pg_dump` is found next to `psql`.
