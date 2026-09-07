@@ -6,7 +6,7 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="3.2.0"
+VERSION="3.3.0"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
 MAX_LABEL_LEN=60
@@ -62,6 +62,13 @@ _json_str() {
     s="${s//$'\n'/\\n}"
     s="${s//$'\r'/\\r}"
     s="${s//$'\t'/\\t}"
+    if [[ "$s" == *[[:cntrl:]]* ]]; then
+        local i c
+        for i in 1 2 3 4 5 6 7 8 11 12 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 127; do
+            c="$(printf "\\$(printf '%03o' "$i")")"
+            s="${s//"$c"/$(printf '\\u%04x' "$i")}"
+        done
+    fi
     printf '"%s"' "$s"
 }
 
@@ -106,7 +113,7 @@ project_name() {
 
 # Clean slug for branch name (feature/auth → feature-auth)
 slugify() {
-    echo "$1" | sed 's/[\/_]/-/g' | sed 's/[^a-zA-Z0-9.-]/-/g' | tr '[:upper:]' '[:lower:]'
+    echo "$1" | sed 's/[\/_.]/-/g' | sed 's/[^a-zA-Z0-9-]/-/g' | tr '[:upper:]' '[:lower:]'
 }
 
 # Short deterministic hash of a string (6 hex chars)
@@ -150,6 +157,16 @@ _is_workspace_dir() {
     parent="$(cd "$root/$WORKTREES_DIR" 2>/dev/null && pwd -P)" || return 1
     real="$(cd "$dir" 2>/dev/null && pwd -P)" || return 1
     [[ "$real" != "$parent" && "$(dirname "$real")" == "$parent" ]]
+}
+
+# True when <dir> is its own git repository (a clone dropped under .worktrees, not a worktree of <root>)
+_is_foreign_repo() {
+    local root="$1" dir="$2" top common
+    top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
+    [[ "$top" == "$(cd "$dir" && pwd -P)" ]] || return 1
+    common="$(cd "$dir" && git rev-parse --git-common-dir 2>/dev/null)" || return 1
+    common="$(cd "$dir" && cd "$common" 2>/dev/null && pwd -P)" || return 1
+    [[ "$common" != "$(cd "$root/.git" && pwd -P)" ]]
 }
 
 # True when <dir> is a git worktree of <root>. A directory whose worktree was pruned
@@ -354,6 +371,31 @@ PY
     fi
 }
 
+# In-place sed through a temporary file: works with BSD and GNU sed alike
+_sed_inplace() {
+    local expr="$1" file="$2" tmp
+    tmp="$(mktemp "${file}.ws-XXXXXX")" || return 1
+    if sed "$expr" "$file" > "$tmp" 2>/dev/null; then
+        cat "$tmp" > "$file" && rm -f "$tmp"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# The line that names the cause in a captured error output: the first fatal/error line, else the last one
+_last_line() {
+    local line
+    line="$(printf '%s\n' "$1" | grep -m1 -E '^(fatal|error|ERROR|psql|mysql|mysqldump)' || true)"
+    [[ -n "$line" ]] || line="$(printf '%s\n' "$1" | sed '/^[[:space:]]*$/d' | tail -1)"
+    printf '%s' "$line"
+}
+
+# Escape a value for the right-hand side of a sed s||| expression
+_sed_escape() {
+    printf '%s' "$1" | sed 's/[&|\\]/\\&/g'
+}
+
 # Set or replace VAR=value in an .env file
 _set_env_var() {
     local file="$1" var="$2" value="$3"
@@ -362,7 +404,7 @@ _set_env_var() {
         return 0
     fi
     if grep -q "^${var}=" "$file" 2>/dev/null; then
-        sed -i '' "s|^${var}=.*|${var}=${value}|" "$file" 2>/dev/null || true
+        _sed_inplace "s|^${var}=.*|${var}=$(_sed_escape "$value")|" "$file" || true
     else
         echo "${var}=${value}" >> "$file"
     fi
@@ -406,7 +448,7 @@ _db_create() {
     case "$conn" in
         mysql|mariadb)
             command -v mysql &>/dev/null || return 1
-            mysql -u"$user" ${pass:+-p"$pass"} -h"$host" ${port:+-P"$port"} \
+            MYSQL_PWD="$pass" mysql -u"$user" -h"$host" ${port:+-P"$port"} \
                 -e "CREATE DATABASE IF NOT EXISTS \`$name\`;" 2>/dev/null || return 1
             ;;
         pgsql)
@@ -440,7 +482,7 @@ _db_drop() {
     case "$conn" in
         mysql|mariadb)
             command -v mysql &>/dev/null || return 1
-            mysql -u"$user" ${pass:+-p"$pass"} -h"$host" ${port:+-P"$port"} \
+            MYSQL_PWD="$pass" mysql -u"$user" -h"$host" ${port:+-P"$port"} \
                 -e "DROP DATABASE IF EXISTS \`$name\`;" 2>/dev/null || return 1
             ;;
         pgsql)
@@ -469,7 +511,7 @@ _get_phpunit_env() {
 
 _set_phpunit_env() {
     local file="$1" var="$2" value="$3"
-    sed -i '' "s|\(<env[[:space:]]\{1,\}name=\"${var}\"[[:space:]]\{1,\}value=\)\"[^\"]*\"|\1\"${value}\"|" "$file" 2>/dev/null || true
+    _sed_inplace "s|\(<env[[:space:]]\{1,\}name=\"${var}\"[[:space:]]\{1,\}value=\)\"[^\"]*\"|\1\"$(_sed_escape "$value")\"|" "$file" || true
 }
 
 _phpunit_file() {
@@ -515,6 +557,41 @@ _test_env_value() {
         fi
     done
     return 0
+}
+
+# Read DB_* from an .env file into the DB_CONN/DB_NAME/DB_USER/DB_PASS/DB_HOST/DB_PORT/DB_SEARCH_PATH globals
+_read_db_env() {
+    local file="$1"
+    DB_CONN="$(_get_env_var "$file" DB_CONNECTION)"
+    DB_NAME="$(_get_env_var "$file" DB_DATABASE)"
+    DB_USER="$(_get_env_var "$file" DB_USERNAME)"
+    DB_PASS="$(_get_env_var "$file" DB_PASSWORD)"
+    DB_HOST="$(_get_env_var "$file" DB_HOST)"
+    DB_PORT="$(_get_env_var "$file" DB_PORT)"
+    DB_SEARCH_PATH="$(_get_env_var "$file" DB_SEARCH_PATH)"
+    DB_USER="${DB_USER:-root}"
+    DB_HOST="${DB_HOST:-127.0.0.1}"
+}
+
+# Same, from the test configuration of a checkout (phpunit.xml, then .env.testing)
+_read_test_db_env() {
+    local dir="$1"
+    DB_CONN="$(_test_env_value "$dir" DB_CONNECTION)"
+    DB_USER="$(_test_env_value "$dir" DB_USERNAME)"
+    DB_PASS="$(_test_env_value "$dir" DB_PASSWORD)"
+    DB_HOST="$(_test_env_value "$dir" DB_HOST)"
+    DB_PORT="$(_test_env_value "$dir" DB_PORT)"
+    DB_SEARCH_PATH="$(_test_env_value "$dir" DB_SEARCH_PATH)"
+}
+
+# The WS_* variables every hook receives
+_export_ws_env() {
+    local root="$1" branch="$2" sname="$3" wt_path="$4"
+    export WS_PROJECT="$(basename "${root:-$wt_path}")"
+    export WS_BRANCH="$branch"
+    export WS_SITE="$sname"
+    export WS_DIR="$wt_path"
+    export WS_ROOT="$root"
 }
 
 # Workspace-scoped database name: <base>_<branch slug>
@@ -764,7 +841,7 @@ EOF
             return 0
             ;;
         ghostty)
-            open -na Ghostty --args --working-directory="$dir" -e $command
+            open -na Ghostty --args --working-directory="$dir" -e "${SHELL:-/bin/zsh}" -lc "$shell_cmd"
             success "Opened Ghostty window '$title'"
             return 0
             ;;
@@ -833,12 +910,19 @@ cmd_create() {
         local pr_num="${BASH_REMATCH[1]}"
         command -v gh >/dev/null 2>&1 \
             || _create_failed worktree "gh CLI is required for PR checkout (install: https://cli.github.com)" 2
+        local pr_site
+        pr_site="$(site_name "pr-${pr_num}")"
+        [[ -d "$root/$WORKTREES_DIR/$pr_site" ]] && _create_failed worktree "Workspace '$pr_site' already exists: $root/$WORKTREES_DIR/$pr_site" 1
         info "Fetching PR #${pr_num}..."
-        local head_ref
+        local head_ref refspec="+pull/${pr_num}/head:pr-${pr_num}"
         head_ref=$(gh pr view "$pr_num" --json headRefName -q .headRefName 2>/dev/null) \
             || _create_failed worktree "PR #${pr_num} not found" 1
-        git -C "$root" fetch origin "pull/${pr_num}/head:pr-${pr_num}" 2>/dev/null \
-            || _create_failed worktree "Failed to fetch pull/${pr_num}/head" 2
+        # A branch checked out elsewhere cannot be force-updated
+        if git -C "$root" worktree list --porcelain 2>/dev/null | grep -qx "branch refs/heads/pr-${pr_num}"; then
+            refspec="pull/${pr_num}/head:pr-${pr_num}"
+        fi
+        git -C "$root" fetch origin "$refspec" 2>/dev/null \
+            || _create_failed worktree "Failed to fetch pull/${pr_num}/head into pr-${pr_num} (checked out elsewhere?)" 2
         branch_name="pr-${pr_num}"
         success "PR #${pr_num} (${head_ref}) fetched as branch ${branch_name}"
     fi
@@ -852,12 +936,13 @@ cmd_create() {
     header "Creating workspace: $sname"
     emit_step worktree running
 
-    if ! grep -qx "$WORKTREES_DIR" "$root/.gitignore" 2>/dev/null; then
+    if ! grep -qxE "${WORKTREES_DIR//./\\.}/?" "$root/.gitignore" 2>/dev/null; then
+        [[ ! -s "$root/.gitignore" || -z "$(tail -c1 "$root/.gitignore")" ]] || echo >> "$root/.gitignore"
         echo "$WORKTREES_DIR" >> "$root/.gitignore"
         success ".worktrees added to .gitignore"
     fi
 
-    cd "$root"
+    cd "$root" || fail_env "Cannot enter $root"
     if git -C "$root" show-ref --verify --quiet "refs/heads/$branch_name" 2>/dev/null; then
         [[ -n "$from_flag" ]] && warn "Branch '$branch_name' already exists — --from '$from_flag' ignored"
         info "Creating worktree on existing branch '$branch_name'..."
@@ -866,10 +951,11 @@ cmd_create() {
     else
         local start_ref start_point
         start_ref="${from_flag:-$(detect_default_branch)}"
+        start_ref="${start_ref#origin/}"
         start_point="$(_resolve_start_point "$root" "$start_ref")" \
             || _create_failed worktree "Start point '$start_ref' not found (neither local branch, origin branch, nor commit)" 1
         info "Creating worktree on branch '$branch_name' from '$start_point'..."
-        git worktree add "$wt_path" -b "$branch_name" "$start_point" \
+        git worktree add --no-track "$wt_path" -b "$branch_name" "$start_point" \
             || _create_failed worktree "Failed to create worktree for branch '$branch_name' from '$start_point'" 2
         if git -C "$root" show-ref --verify --quiet "refs/heads/$start_ref" 2>/dev/null \
            || git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$start_ref" 2>/dev/null; then
@@ -994,7 +1080,7 @@ _resolve_source_root() {
         return 0
     fi
     local main_wt
-    main_wt="$(git -C "$top" worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')"
+    main_wt="$(git -C "$top" worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //' || true)"
     if [[ -n "$main_wt" && "$main_wt" != "$top" ]]; then
         echo "$main_wt"
         return 0
@@ -1010,16 +1096,12 @@ _provision() {
     local proto
     proto="$(site_protocol "$sname")"
     [[ "$secure" == "--secure" ]] && proto="https"
-    export WS_PROJECT="$(basename "${root:-$wt_path}")"
-    export WS_BRANCH="$branch_name"
-    export WS_SITE="$sname"
-    export WS_DIR="$wt_path"
+    _export_ws_env "$root" "$branch_name" "$sname" "$wt_path"
     export WS_URL=""
     _profile_is_plain || export WS_URL="${proto}://${sname}.test"
-    export WS_ROOT="$root"
     _set_ws_profile "${root:-$wt_path}" "$branch_name" "$WS_PROFILE"
 
-    cd "$wt_path"
+    cd "$wt_path" || fail_env "Cannot enter $wt_path"
     emit_step hooks running "pre-create"
     _run_hook "pre-create" "$root"
     emit_step hooks done "pre-create"
@@ -1027,7 +1109,7 @@ _provision() {
     if _profile_is_plain; then
         _setup_env_plain "$root"
     else
-        _setup_env "$root" "$sname" "$secure"
+        _setup_env "$root" "$sname" "$secure" "$fresh"
     fi
     emit_step env done
     emit_step deps running
@@ -1050,7 +1132,7 @@ _provision() {
     _setup_test_database "$branch_name" "$root"
     emit_step test_db done
     emit_step storage running
-    _setup_storage "$root"
+    _setup_storage "$root" "$fresh"
     emit_step storage done
     emit_step herd running
     _setup_herd "$sname" "$secure" "$wt_path" "$root"
@@ -1117,11 +1199,14 @@ _setup_env() {
     local root="$1"
     local sname="$2"
     local secure="${3:-}"
+    local fresh="${4:-}"
 
     local proto="http"
     [[ "$secure" == "--secure" ]] && proto="https"
 
-    if [[ -n "$root" && -f "$root/.env" ]]; then
+    if [[ -f ".env" && "$fresh" != "--fresh" ]]; then
+        info ".env already present — kept"
+    elif [[ -n "$root" && -f "$root/.env" ]]; then
         cp "$root/.env" .env
         success ".env copied from main project"
     elif [[ ! -f ".env" && -f ".env.example" ]]; then
@@ -1275,7 +1360,7 @@ _is_managed_file() {
 _relative_path() {
     local target="$1" from_dir="$2"
     if command -v python3 &>/dev/null; then
-        python3 -c 'import os, sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$target" "$from_dir" 2>/dev/null && return 0
+        python3 -c 'import os, sys; print(os.path.relpath(os.path.realpath(sys.argv[1]), os.path.realpath(sys.argv[2])))' "$target" "$from_dir" 2>/dev/null && return 0
     fi
     echo "$target"
 }
@@ -1349,6 +1434,12 @@ _setup_database() {
     local original_db db_connection cloned=""
     original_db="$(_get_env_var "$source_env" DB_DATABASE)"
     db_connection="$(_get_env_var .env DB_CONNECTION)"
+    # Standalone re-runs read the already renamed .env: the original name is kept alongside
+    if [[ -z "$root" ]]; then
+        local saved_db
+        saved_db="$(_get_env_var .env WS_SOURCE_DB)"
+        [[ -z "$saved_db" ]] || original_db="$saved_db"
+    fi
 
     if [[ "$db_connection" == "sqlite" ]]; then
         local rc=0
@@ -1367,15 +1458,11 @@ _setup_database() {
     workspace_db="$(_workspace_db_name "$original_db" "$branch_name")"
 
     _set_env_var .env DB_DATABASE "$workspace_db"
+    [[ -n "$root" ]] || _set_env_var .env WS_SOURCE_DB "$original_db"
     export WS_DB="$workspace_db"
 
-    local db_user db_pass db_host db_port
-    db_user="$(_get_env_var .env DB_USERNAME)"
-    db_pass="$(_get_env_var .env DB_PASSWORD)"
-    db_host="$(_get_env_var .env DB_HOST)"
-    db_port="$(_get_env_var .env DB_PORT)"
-    db_user="${db_user:-root}"
-    db_host="${db_host:-127.0.0.1}"
+    _read_db_env .env
+    local db_user="$DB_USER" db_pass="$DB_PASS" db_host="$DB_HOST" db_port="$DB_PORT"
 
     # An existing database is somebody's data (a re-run, or another workspace): never clone over it
     if _db_exists "$db_connection" "$workspace_db" "$db_user" "$db_pass" "$db_host" "$db_port"; then
@@ -1388,10 +1475,11 @@ _setup_database() {
         mysql|mariadb)
             if command -v mysql &>/dev/null; then
                 local -a my_args=(-u"$db_user" -h"$db_host")
-                [[ -n "$db_pass" ]] && my_args+=(-p"$db_pass")
                 [[ -n "$db_port" ]] && my_args+=(-P"$db_port")
+                export MYSQL_PWD="$db_pass"
 
-                if mysql "${my_args[@]}" -e "CREATE DATABASE IF NOT EXISTS \`$workspace_db\`;" 2>/dev/null; then
+                local db_err=""
+                if db_err="$(mysql "${my_args[@]}" -e "CREATE DATABASE IF NOT EXISTS \`$workspace_db\`;" 2>&1 >/dev/null)"; then
                     success "Database '$workspace_db' created (MySQL)"
                     if [[ -z "$fresh" && "$workspace_db" != "$original_db" ]] && command -v mysqldump &>/dev/null; then
                         info "Cloning data from '$original_db'..."
@@ -1404,12 +1492,13 @@ _setup_database() {
                         fi
                     fi
                 else
-                    warn "Could not create database — do it manually"
+                    warn "Could not create database — do it manually ($(_last_line "$db_err"))"
                 fi
+                unset MYSQL_PWD
             fi
             ;;
         pgsql)
-            local psql_cmd=""
+            local psql_cmd="" db_err=""
             psql_cmd="$(_psql_cmd)" || psql_cmd=""
 
             if [[ -n "$psql_cmd" ]]; then
@@ -1424,15 +1513,15 @@ _setup_database() {
                         -c "CREATE DATABASE \"$workspace_db\" TEMPLATE \"$original_db\";" 2>/dev/null; then
                         success "Database '$workspace_db' cloned from '$original_db' (TEMPLATE)"
                         cloned="1"
-                    elif PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d postgres \
-                        -c "CREATE DATABASE \"$workspace_db\";" 2>/dev/null; then
+                    elif db_err="$(PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d postgres \
+                        -c "CREATE DATABASE \"$workspace_db\";" 2>&1 >/dev/null)"; then
                         success "Database '$workspace_db' created (PostgreSQL)"
                         if [[ -z "$pg_dump_cmd" ]]; then
                             warn "pg_dump not found — database left empty (migrations will run)"
                         else
                             info "Cloning data from '$original_db' (pg_dump)..."
                             if PGPASSWORD="${db_pass:-}" "$pg_dump_cmd" -U "$db_user" -h "$db_host" ${db_port:+-p "$db_port"} "$original_db" 2>/dev/null \
-                                | PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -q -d "$workspace_db" >/dev/null 2>&1; then
+                                | PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -q -v ON_ERROR_STOP=1 --single-transaction -d "$workspace_db" >/dev/null 2>&1; then
                                 success "Database cloned from '$original_db'"
                                 cloned="1"
                             else
@@ -1440,19 +1529,18 @@ _setup_database() {
                             fi
                         fi
                     else
-                        warn "Could not create database — do it manually"
+                        warn "Could not create database — do it manually ($(_last_line "$db_err"))"
                     fi
                 else
-                    if PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d postgres \
-                        -c "CREATE DATABASE \"$workspace_db\";" 2>/dev/null; then
+                    if db_err="$(PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d postgres \
+                        -c "CREATE DATABASE \"$workspace_db\";" 2>&1 >/dev/null)"; then
                         success "Database '$workspace_db' created (PostgreSQL)"
                     else
-                        warn "Could not create database — do it manually"
+                        warn "Could not create database — do it manually ($(_last_line "$db_err"))"
                     fi
                 fi
 
-                local search_path
-                search_path="$(_get_env_var .env DB_SEARCH_PATH)"
+                local search_path="$DB_SEARCH_PATH"
                 if [[ -n "$search_path" && -z "$cloned" ]]; then
                     if PGPASSWORD="${db_pass:-}" "$psql_cmd" "${psql_args[@]}" -d "$workspace_db" \
                         -c "CREATE SCHEMA IF NOT EXISTS \"$search_path\";" 2>/dev/null; then
@@ -1522,7 +1610,7 @@ _db_exists() {
         mysql|mariadb)
             command -v mysql &>/dev/null || return 1
             local out
-            out="$(mysql -u"$user" ${pass:+-p"$pass"} -h"$host" ${port:+-P"$port"} -N -e "SHOW DATABASES LIKE '$name';" 2>/dev/null || true)"
+            out="$(MYSQL_PWD="$pass" mysql -u"$user" -h"$host" ${port:+-P"$port"} -N -e "SHOW DATABASES LIKE '$name';" 2>/dev/null || true)"
             [[ -n "$out" ]]
             ;;
         pgsql)
@@ -1567,14 +1655,8 @@ _setup_test_database() {
     workspace_test_db="$(_workspace_test_db_name "$test_db" "$branch_name")"
     [[ "$workspace_test_db" != "$test_db" ]] || return 0
 
-    local db_user db_pass db_host db_port search_path
-    db_user="$(_test_env_value . DB_USERNAME)"
-    db_pass="$(_test_env_value . DB_PASSWORD)"
-    db_host="$(_test_env_value . DB_HOST)"
-    db_port="$(_test_env_value . DB_PORT)"
-    search_path="$(_test_env_value . DB_SEARCH_PATH)"
-
-    if _db_create "$db_connection" "$workspace_test_db" "$db_user" "$db_pass" "$db_host" "$db_port" "$search_path"; then
+    _read_test_db_env .
+    if _db_create "$db_connection" "$workspace_test_db" "$DB_USER" "$DB_PASS" "$DB_HOST" "$DB_PORT" "$DB_SEARCH_PATH"; then
         success "Test database '$workspace_test_db' created"
     else
         warn "Could not create test database '$workspace_test_db' — do it manually"
@@ -1599,14 +1681,17 @@ _setup_test_database() {
 
 # Uploads (storage/app) cloned via CoW + public/storage symlink
 _setup_storage() {
-    local root="$1"
+    local root="$1" fresh="${2:-}"
     [[ -f "artisan" ]] || return 0
 
-    if [[ -n "$root" && -d "$root/storage/app" ]]; then
-        local tmp="storage/.app.ws-tmp"
-        rm -rf "$tmp"
+    local marker="storage/.ws-storage-cloned"
+    if [[ -f "$marker" && "$fresh" != "--fresh" ]]; then
+        info "storage/app already cloned — kept"
+    elif [[ -n "$root" && -d "$root/storage/app" ]]; then
+        local tmp
+        tmp="$(mktemp -d storage/.app.ws-XXXXXX)" || { warn "Could not create a temporary directory in storage/"; return 0; }
         if _cow_copy "$root/storage/app" "$tmp"; then
-            rm -rf storage/app && mv "$tmp" storage/app
+            rm -rf storage/app && mv "$tmp" storage/app && touch "$marker"
             success "storage/app cloned from main project"
         else
             rm -rf "$tmp"
@@ -1663,24 +1748,24 @@ _setup_vite() {
     if ! grep -q "host:" "$vite_config" 2>/dev/null; then
         info "Adding host: 'localhost', cors: true, port: from VITE_PORT to $vite_config..."
         if grep -q "server:" "$vite_config" 2>/dev/null; then
-            sed -i '' "/server:/a\\
+            _sed_inplace "/server:/a\\
 \\            host: 'localhost',\\
 \\            cors: true,\\
-\\            port: Number(process.env.VITE_PORT) || 5173," "$vite_config" 2>/dev/null || true
+\\            port: Number(process.env.VITE_PORT) || 5173," "$vite_config" || true
         else
-            sed -i '' "/plugins:/i\\
+            _sed_inplace "/plugins:/i\\
 \\        server: {\\
 \\            host: 'localhost',\\
 \\            cors: true,\\
 \\            port: Number(process.env.VITE_PORT) || 5173,\\
-\\        }," "$vite_config" 2>/dev/null || true
+\\        }," "$vite_config" || true
         fi
         patched="1"
         success "vite.config: host: 'localhost', cors: true, port from VITE_PORT"
     elif ! grep -q "process.env.VITE_PORT" "$vite_config" 2>/dev/null; then
         info "Adding port: Number(process.env.VITE_PORT) || 5173 to $vite_config..."
-        sed -i '' "/host: 'localhost'/a\\
-\\            port: Number(process.env.VITE_PORT) || 5173," "$vite_config" 2>/dev/null || true
+        _sed_inplace "/host: 'localhost'/a\\
+\\            port: Number(process.env.VITE_PORT) || 5173," "$vite_config" || true
         patched="1"
         success "vite.config: port wired to VITE_PORT"
     fi
@@ -1740,11 +1825,11 @@ _select_workspace() {
         local workspaces=()
         for dir in "$wt_dir"/*/; do
             [[ -d "$dir" ]] || continue
-            local name branch
+            local name
             name="$(basename "$dir")"
             workspaces+=("$name")
-            branch=$(git -C "$dir" branch --show-current 2>/dev/null || echo "?")
-            echo -e "  ${CYAN}$i)${NC} $name ${DIM}($branch)${NC}" >&2
+            _workspace_record "$root" "$name"
+            echo -e "  ${CYAN}$i)${NC} $name ${DIM}($WR_BRANCH)${NC}" >&2
             ((i++))
         done
 
@@ -1798,7 +1883,7 @@ cmd_run() {
     info "Launching $agent in '$(basename "$wt_path")'..."
     echo -e "${DIM}─────────────────────────────────────${NC}"
 
-    cd "$wt_path"
+    cd "$wt_path" || fail_env "Cannot enter $wt_path"
     exec "$agent" ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
 }
 
@@ -1981,6 +2066,7 @@ cmd_finish() {
     _is_live_worktree "$root" "$wt_path" || fail "Workspace '$sname' has no git worktree behind it (stale). Run: ws destroy $sname"
 
     wt_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
+    [[ -n "$wt_branch" ]] || fail "Workspace '$sname' is on a detached HEAD — check out a branch first."
     resolve_profile "$root" "" "$wt_branch" >/dev/null
 
     local base_branch
@@ -2010,11 +2096,7 @@ cmd_finish() {
         esac
     fi
 
-    export WS_PROJECT="$(basename "$root")"
-    export WS_BRANCH="$wt_branch"
-    export WS_SITE="$sname"
-    export WS_DIR="$wt_path"
-    export WS_ROOT="$root"
+    _export_ws_env "$root" "$wt_branch" "$sname" "$wt_path"
     export WS_BASE="$base_branch"
 
     case "$finish_mode" in
@@ -2068,14 +2150,17 @@ _finish_maybe_cleanup() {
 _finish_pr() {
     local sname="$1" wt_path="$2" wt_branch="$3" root="$4" base_branch="$5"
 
-    cd "$wt_path"
+    cd "$wt_path" || fail_env "Cannot enter $wt_path"
 
     _finish_commit_changes "$sname" "$wt_path"
 
     info "Pushing branch '$wt_branch'..."
-    git push -u origin "$wt_branch" 2>/dev/null && \
-        success "Branch pushed" || \
-        fail_env "Push failed."
+    local push_err=""
+    if push_err="$(git push -u origin "$wt_branch" 2>&1 >/dev/null)"; then
+        success "Branch pushed"
+    else
+        fail_env "Push failed: $(_last_line "$push_err")"
+    fi
 
     if command -v gh &>/dev/null; then
         local pr_title="$FINISH_TITLE" pr_body="" desc_choice="2"
@@ -2137,7 +2222,7 @@ _finish_merge() {
         [[ "$confirm_main" =~ ^[yY]$ ]] || exit 0
     fi
 
-    cd "$root"
+    cd "$root" || fail_env "Cannot enter $root"
     if [[ "$current_branch" != "$base_branch" ]]; then
         if [[ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
             fail "The main checkout ('$current_branch') has uncommitted changes — commit or stash them before switching to '$base_branch'."
@@ -2167,6 +2252,7 @@ _finish_abandon() {
         [[ "$confirm" =~ ^[yY]$ ]] || exit 0
     fi
 
+    WS_FORCE_BRANCH_DELETE="1"
     _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root"
 }
 
@@ -2185,19 +2271,13 @@ _drop_test_database() {
         return 0
     fi
 
-    local test_conn test_user test_pass test_host test_port
-    test_conn="$(_test_env_value "$wt_path" DB_CONNECTION)"
-    case "${test_conn:-}" in
+    _read_test_db_env "$wt_path"
+    case "${DB_CONN:-}" in
         mysql|mariadb|pgsql) ;;
         *) return 0 ;;
     esac
 
-    test_user="$(_test_env_value "$wt_path" DB_USERNAME)"
-    test_pass="$(_test_env_value "$wt_path" DB_PASSWORD)"
-    test_host="$(_test_env_value "$wt_path" DB_HOST)"
-    test_port="$(_test_env_value "$wt_path" DB_PORT)"
-
-    if _db_drop "$test_conn" "$ws_test_db" "$test_user" "$test_pass" "$test_host" "$test_port"; then
+    if _db_drop "$DB_CONN" "$ws_test_db" "$DB_USER" "$DB_PASS" "$DB_HOST" "$DB_PORT"; then
         success "Test database '$ws_test_db' dropped"
     else
         warn "Could not drop test database '$ws_test_db'"
@@ -2240,15 +2320,8 @@ _cleanup_workspace() {
     elif [[ "$keep_db" == "--keep-db" ]]; then
         info "Database kept"
     elif [[ -f "$wt_path/.env" ]]; then
-        local ws_db db_connection db_user db_pass db_host db_port
-        ws_db="$(_get_env_var "$wt_path/.env" DB_DATABASE)"
-        db_connection="$(_get_env_var "$wt_path/.env" DB_CONNECTION)"
-        db_user="$(_get_env_var "$wt_path/.env" DB_USERNAME)"
-        db_pass="$(_get_env_var "$wt_path/.env" DB_PASSWORD)"
-        db_host="$(_get_env_var "$wt_path/.env" DB_HOST)"
-        db_port="$(_get_env_var "$wt_path/.env" DB_PORT)"
-        db_user="${db_user:-root}"
-        db_host="${db_host:-127.0.0.1}"
+        _read_db_env "$wt_path/.env"
+        local ws_db="$DB_NAME" db_connection="$DB_CONN" db_user="$DB_USER" db_pass="$DB_PASS" db_host="$DB_HOST" db_port="$DB_PORT"
 
         local main_db=""
         [[ -f "$root/.env" ]] && main_db="$(_get_env_var "$root/.env" DB_DATABASE)"
@@ -2272,8 +2345,9 @@ _cleanup_workspace() {
         _drop_test_database "$wt_path" "$root"
     fi
 
-    cd "$root"
+    cd "$root" || fail_env "Cannot enter $root"
     _is_workspace_dir "$root" "$wt_path" || fail_env "Refusing to remove '$wt_path': not a workspace directory"
+    _is_foreign_repo "$root" "$wt_path" && fail_env "Refusing to remove '$wt_path': a separate git repository"
     if git worktree remove "$wt_path" --force 2>/dev/null; then
         success "Worktree removed"
     else
@@ -2283,9 +2357,15 @@ _cleanup_workspace() {
     fi
 
     if [[ -n "$wt_branch" ]]; then
-        git branch -d "$wt_branch" 2>/dev/null && \
-            success "Branch '$wt_branch' deleted" || \
-            warn "Branch '$wt_branch' not deleted (not merged yet?)"
+        if [[ -n "${WS_FORCE_BRANCH_DELETE:-}" ]]; then
+            git branch -D "$wt_branch" 2>/dev/null && \
+                success "Branch '$wt_branch' deleted" || \
+                warn "Branch '$wt_branch' could not be deleted"
+        elif git branch -d "$wt_branch" 2>/dev/null; then
+            success "Branch '$wt_branch' deleted"
+        else
+            warn "Branch '$wt_branch' kept: not merged into its base yet (delete it with git branch -D)"
+        fi
     fi
 
     WS_REMOVED="1"
@@ -2315,6 +2395,7 @@ cmd_destroy() {
 
     [[ -d "$wt_path" ]] || fail "Workspace '$sname' not found."
     _is_workspace_dir "$root" "$wt_path" || fail "'$sname' is not a workspace directory."
+    _is_foreign_repo "$root" "$wt_path" && fail "'$sname' is a separate git repository, not a workspace of this project — remove it yourself."
 
     local wt_branch="" stale=""
     if _is_live_worktree "$root" "$wt_path"; then
@@ -2341,11 +2422,7 @@ cmd_destroy() {
     fi
 
     resolve_profile "$root" "" "$wt_branch" >/dev/null
-    export WS_PROJECT="$(basename "$root")"
-    export WS_BRANCH="$wt_branch"
-    export WS_SITE="$sname"
-    export WS_DIR="$wt_path"
-    export WS_ROOT="$root"
+    _export_ws_env "$root" "$wt_branch" "$sname" "$wt_path"
     _run_hook "pre-destroy" "$root"
 
     _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root" "$keep_db"
@@ -2384,7 +2461,7 @@ cmd_hook() {
 
             local wt_path
             wt_path="$(worktree_path "$name")"
-            printf '{"hookSpecificOutput":{"hookEventName":"WorktreeCreate","worktree_path":"%s"}}\n' "$wt_path"
+            printf '{"hookSpecificOutput":{"hookEventName":"WorktreeCreate","worktree_path":%s}}\n' "$(_json_str "$wt_path")"
             ;;
         remove)
             local wt_path
@@ -2396,6 +2473,7 @@ cmd_hook() {
             root="${wt_path%%/$WORKTREES_DIR/*}"
             sname="$(basename "$wt_path")"
             _is_workspace_dir "$root" "$wt_path" || exit 0
+            _is_foreign_repo "$root" "$wt_path" && exit 0
 
             if _is_live_worktree "$root" "$wt_path"; then
                 if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
@@ -2404,9 +2482,9 @@ cmd_hook() {
                 fi
                 wt_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
             fi
-            cd "$root"
+            cd "$root" || fail_env "Cannot enter $root"
             resolve_profile "$root" "" "$wt_branch" >/dev/null
-            export WS_PROJECT="$(basename "$root")" WS_BRANCH="$wt_branch" WS_SITE="$sname" WS_DIR="$wt_path" WS_ROOT="$root"
+            _export_ws_env "$root" "$wt_branch" "$sname" "$wt_path"
             _run_hook "pre-destroy" "$root" >&2
             _cleanup_workspace "$sname" "$wt_path" "$wt_branch" "$root" >&2
             ;;

@@ -133,7 +133,7 @@ ws setup --from ~/Sites/my-project         # inside a clone/copy of the project 
 ws setup --from ~/Sites/my-project --name "$(basename "$PWD")"   # Herd site named after the folder
 ```
 
-`ws setup` runs the exact same provisioning as `ws create` (env, deps, DB, Herd, hooks) on the current directory, whatever created it. The source repository is auto-detected for git worktrees; for full clones pass `--from` or set `WS_SOURCE=/path/to/main-repo`. `--standalone` provisions with no source (uses `.env.example`, no hooks/`.ws.json`).
+`ws setup` runs the exact same provisioning as `ws create` (env, deps, DB, Herd, hooks) on the current directory, whatever created it. Running it again is safe: an existing `.env`, `storage/app` clone and database are kept (`--fresh` replaces them). The source repository is auto-detected for git worktrees; for full clones pass `--from` or set `WS_SOURCE=/path/to/main-repo`. `--standalone` provisions with no source (uses `.env.example`, no hooks/`.ws.json`).
 
 ### View workspace status
 
@@ -191,7 +191,7 @@ ws destroy feature/auth --keep-db    # keeps the database
 ws destroy feature/auth --yes        # no confirmation prompt
 ```
 
-Deletes the worktree, the database and the test database, the Herd link(s) and certificate if applicable, and kills the workspace's Vite dev server. The local branch is deleted only when it is merged (`git branch -d`); otherwise it is kept and a warning says so. Use `--keep-db` to keep the databases. Only databases named `<main database>_…` (the names `ws` creates) are ever dropped; a workspace `.env` pointing anywhere else is left alone. A stale directory (no git worktree behind it) is removed without touching any branch. Uncommitted changes in the worktree are listed in the confirmation and lost with it.
+Deletes the worktree, the database and the test database, the Herd link(s) and certificate if applicable, and kills the workspace's Vite dev server. The local branch is deleted only when it is merged (`git branch -d`); otherwise it is kept and a warning says so. Use `--keep-db` to keep the databases. Only databases named `<main database>_…` (the names `ws` creates) are ever dropped; a workspace `.env` pointing anywhere else is left alone. A stale directory (no git worktree behind it) is removed without touching any branch; a separate git repository dropped under `.worktrees/` is refused. Uncommitted changes in the worktree are listed in the confirmation and lost with it. `ws finish --abandon` deletes the branch even when it is not merged.
 
 ## Machine-readable output (`--json`)
 
@@ -388,7 +388,7 @@ Herd sites use the format `project-branch.test` to avoid conflicts between proje
 | `my-app` | `feature/login` | `my-app-feature-login.test` |
 | `other-app` | `feature/login` | `other-app-feature-login.test` |
 
-`/` and `_` both become `-`, so `feature/login` and `feature_login` name the same workspace and the second `ws create` is refused. Database names use `_` instead (`my_app_feature_login`).
+`/`, `_` and `.` all become `-`, so `feature/login`, `feature_login` and `release/1.2` (→ `release-1-2`) yield valid site and database names, and two branches that differ only by those characters name the same workspace: the second `ws create` is refused. Database names use `_` instead (`my_app_feature_login`).
 
 ## Structure
 
@@ -460,6 +460,7 @@ Only Redis and Memcached are namespaced automatically. If you use another shared
 
 ## Changelog
 
+- **3.3.0** — `.` is slugified like `/` and `_`; `--from origin/<branch>` records its base and sets no upstream; `create pr:N` refreshes a force-pushed PR; `finish --abandon` deletes the branch; `finish` refuses a detached HEAD; `setup` re-runs keep `.env`, `storage/app` and the database name; a separate repository under `.worktrees/` is never removed; MySQL passwords go through `MYSQL_PWD`; database and push failures name their cause; `sed` edits are portable and escape their values; JSON output escapes every control character.
 - **3.2.0** — `create`/`setup` close their stream with a `failed` event on any hard failure; existing databases are never cloned over; SQLite keeps `DB_DATABASE` and clones the file; `_` and `-` name the same workspace; Vite and `.env.testing` patches are `skip-worktree`; `destroy` lists uncommitted changes; `herd links` read once per command.
 - **3.1.0** — The profile is recorded per workspace (`branch.<name>.ws-profile`) and wins over `.ws.json`; detection needs `artisan` only; unknown profiles and invalid `.ws.json` warn instead of failing; `"files"` entries must be gitignored; `WS_PROFILE` reaches every hook; `pg_dump` is found next to `psql`.
 - **3.0.2** — `destroy` refuses `.`, `..` and anything outside `.worktrees/`; stale directories never run git commands against the main repo; only `<main database>_…` databases are dropped; `"files"` refuses the files `ws` provisions itself; Laravel projects without `vite.config.*` provision fully.
