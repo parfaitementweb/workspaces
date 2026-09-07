@@ -6,7 +6,7 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="3.0.1"
+VERSION="3.0.2"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
 MAX_LABEL_LEN=60
@@ -131,11 +131,32 @@ site_name() {
 resolve_site_name() {
     local root
     root="$(find_project_root)"
-    if [[ -d "$root/$WORKTREES_DIR/$1" ]]; then
-        echo "$1"
-    else
-        site_name "$1"
-    fi
+    [[ -n "$1" ]] || fail "Workspace name required."
+    case "$1" in
+        .|..|*/*) ;;
+        *) [[ -d "$root/$WORKTREES_DIR/$1" ]] && { echo "$1"; return 0; } ;;
+    esac
+    site_name "$1"
+}
+
+# True when <dir> is a direct child of <root>/.worktrees (after resolving symlinks)
+_is_workspace_dir() {
+    local root="$1" dir="$2" parent real
+    parent="$(cd "$root/$WORKTREES_DIR" 2>/dev/null && pwd -P)" || return 1
+    real="$(cd "$dir" 2>/dev/null && pwd -P)" || return 1
+    [[ "$real" != "$parent" && "$(dirname "$real")" == "$parent" ]]
+}
+
+# True when <dir> is a git worktree of <root>. A directory whose worktree was pruned
+# (or a foreign checkout dropped under .worktrees) makes git answer for another repo.
+_is_live_worktree() {
+    local root="$1" dir="$2" top common
+    top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
+    [[ "$top" == "$(cd "$dir" && pwd -P)" ]] || return 1
+    common="$(cd "$dir" && git rev-parse --git-common-dir 2>/dev/null)" || return 1
+    [[ -n "$common" ]] || return 1
+    common="$(cd "$dir" && cd "$common" 2>/dev/null && pwd -P)" || return 1
+    [[ "$common" == "$(cd "$root/.git" && pwd -P)" ]]
 }
 
 # Worktree path (uses site_name for the directory)
@@ -304,6 +325,10 @@ PY
 # Set or replace VAR=value in an .env file
 _set_env_var() {
     local file="$1" var="$2" value="$3"
+    if [[ -L "$file" ]]; then
+        warn "$file is a symlink — not modified"
+        return 0
+    fi
     if grep -q "^${var}=" "$file" 2>/dev/null; then
         sed -i '' "s|^${var}=.*|${var}=${value}|" "$file" 2>/dev/null || true
     else
@@ -445,13 +470,23 @@ _test_env_value() {
     return 0
 }
 
-# Workspace-scoped name derived from the project's test database
-_workspace_test_db_name() {
-    local test_db="$1" branch_name="$2"
+# Workspace-scoped database name: <base>_<branch slug>
+_workspace_db_name() {
+    local base_db="$1" branch_name="$2"
     local branch_slug name
     branch_slug="$(slugify "$branch_name")"
-    name="$(_truncate_label "${test_db}_${branch_slug//-/_}" 63)"
+    name="$(_truncate_label "${base_db}_${branch_slug//-/_}" 63)"
     echo "${name//-/_}"
+}
+
+_workspace_test_db_name() {
+    _workspace_db_name "$1" "$2"
+}
+
+# Only databases named by ws itself (<main>_<something>) may ever be dropped
+_is_workspace_db_name() {
+    local name="$1" main_db="$2"
+    [[ -n "$name" && -n "$main_db" && "$name" == "${main_db}_"* ]]
 }
 
 # Copy-on-write directory copy (APFS clonefile). Falls back to a regular copy.
@@ -523,12 +558,10 @@ _workspace_record() {
     local dir="$root/$WORKTREES_DIR/$sname"
     WR_SITE="$sname"
     WR_PATH="$dir"
-    # A directory left behind after its worktree was pruned makes git answer for the main repo.
     WR_STALE=""
-    if [[ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" != "$(cd "$dir" && pwd -P)" ]]; then
-        WR_STALE="true"
-    fi
-    WR_BRANCH="$(git -C "$dir" branch --show-current 2>/dev/null || true)"
+    _is_live_worktree "$root" "$dir" || WR_STALE="true"
+    WR_BRANCH=""
+    [[ -n "$WR_STALE" ]] || WR_BRANCH="$(git -C "$dir" branch --show-current 2>/dev/null || true)"
     [[ -z "$WR_STALE" ]] || WR_BRANCH="?"
     [[ -n "$WR_BRANCH" ]] || WR_BRANCH="$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo "?")"
     WR_BASE="$(_get_ws_base "$root" "$WR_BRANCH")"
@@ -1091,8 +1124,13 @@ _setup_local_files() {
     [[ -n "$root" ]] || return 0
     local f target
     while IFS= read -r f; do
+        f="${f%/}"
         if [[ "$f" == /* || "$f" == ".." || "$f" == ../* || "$f" == */../* || "$f" == */.. ]]; then
             warn "files: '$f' must be a path relative to the repo root — skipped"
+            continue
+        fi
+        if _is_managed_file "$f"; then
+            warn "files: '$f' is provisioned by ws and cannot be linked — skipped"
             continue
         fi
         if [[ ! -e "$root/$f" ]]; then
@@ -1104,6 +1142,14 @@ _setup_local_files() {
         target="$(_relative_path "$root/$f" "$(cd "$(dirname "$f")" && pwd)")"
         ln -s "$target" "$f" && success "$f linked to main project"
     done < <(_ws_config_files "$root")
+}
+
+# Files and directories ws writes or clones per workspace: linking them would edit the main project
+_is_managed_file() {
+    case "$1" in
+        .env|.env.testing|phpunit.xml|phpunit.xml.dist|database/*.sqlite|storage|storage/*|public/storage|vendor|vendor/*|node_modules|node_modules/*) return 0 ;;
+    esac
+    return 1
 }
 
 # Path of <target> relative to <from_dir>; absolute when it cannot be computed
@@ -1185,10 +1231,8 @@ _setup_database() {
     original_db="$(_get_env_var "$source_env" DB_DATABASE)"
     [[ -n "$original_db" ]] || return 0
 
-    local branch_slug workspace_db
-    branch_slug="$(slugify "$branch_name")"
-    workspace_db="$(_truncate_label "${original_db}_${branch_slug//-/_}" 63)"
-    workspace_db="${workspace_db//-/_}"
+    local workspace_db
+    workspace_db="$(_workspace_db_name "$original_db" "$branch_name")"
 
     _set_env_var .env DB_DATABASE "$workspace_db"
     export WS_DB="$workspace_db"
@@ -1438,7 +1482,7 @@ _setup_herd() {
 
 _setup_vite() {
     local vite_config
-    vite_config="$(ls vite.config.* 2>/dev/null | head -1)"
+    vite_config="$(ls vite.config.* 2>/dev/null | head -1 || true)"
     [[ -n "$vite_config" ]] || return 0
 
     local patched=""
@@ -1746,6 +1790,7 @@ cmd_finish() {
     local wt_path sname wt_branch
     wt_path="$(_select_workspace "$branch_arg" "Which workspace to finish?")"
     sname="$(basename "$wt_path")"
+    _is_live_worktree "$root" "$wt_path" || fail "Workspace '$sname' has no git worktree behind it (stale). Run: ws destroy $sname"
 
     wt_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
 
@@ -1942,8 +1987,8 @@ _drop_test_database() {
     [[ -n "$root" ]] && main_test_db="$(_detect_test_db "$root")"
     [[ -n "$ws_test_db" ]] || return 0
 
-    if [[ "$ws_test_db" == "$main_test_db" ]]; then
-        warn "Workspace uses the main test database '$ws_test_db' — not dropped"
+    if ! _is_workspace_db_name "$ws_test_db" "$main_test_db"; then
+        warn "Test database '$ws_test_db' was not created by ws — not dropped"
         return 0
     fi
 
@@ -2010,11 +2055,10 @@ _cleanup_workspace() {
         db_user="${db_user:-root}"
         db_host="${db_host:-127.0.0.1}"
 
-        # Never drop the main project's database
         local main_db=""
         [[ -f "$root/.env" ]] && main_db="$(_get_env_var "$root/.env" DB_DATABASE)"
 
-        if [[ -n "$ws_db" && "$ws_db" != "$main_db" ]]; then
+        if _is_workspace_db_name "$ws_db" "$main_db"; then
             case "${db_connection:-}" in
                 mysql|mariadb|pgsql)
                     if _db_drop "$db_connection" "$ws_db" "$db_user" "$db_pass" "$db_host" "$db_port"; then
@@ -2025,7 +2069,7 @@ _cleanup_workspace() {
                     ;;
             esac
         elif [[ -n "$ws_db" ]]; then
-            warn "Workspace uses the main database '$ws_db' — not dropped"
+            warn "Database '$ws_db' was not created by ws — not dropped"
         fi
     fi
 
@@ -2034,6 +2078,7 @@ _cleanup_workspace() {
     fi
 
     cd "$root"
+    _is_workspace_dir "$root" "$wt_path" || fail_env "Refusing to remove '$wt_path': not a workspace directory"
     if git worktree remove "$wt_path" --force 2>/dev/null; then
         success "Worktree removed"
     else
@@ -2074,13 +2119,22 @@ cmd_destroy() {
     wt_path="$root/$WORKTREES_DIR/$sname"
 
     [[ -d "$wt_path" ]] || fail "Workspace '$sname' not found."
+    _is_workspace_dir "$root" "$wt_path" || fail "'$sname' is not a workspace directory."
 
-    local wt_branch
-    wt_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
+    local wt_branch="" stale=""
+    if _is_live_worktree "$root" "$wt_path"; then
+        wt_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
+    else
+        stale="1"
+    fi
 
     _out "${RED}${BOLD}Deleting workspace '$sname'${NC}"
     _out "  Worktree: $wt_path"
-    _out "  Branch:   $wt_branch"
+    if [[ -n "$stale" ]]; then
+        _out "  Branch:   ? ${DIM}(stale: no git worktree behind it)${NC}"
+    else
+        _out "  Branch:   $wt_branch"
+    fi
     [[ -z "$keep_db" ]] || _out "  ${DIM}(database kept)${NC}"
     _out ""
     if [[ -z "$yes" ]]; then
@@ -2139,15 +2193,18 @@ cmd_hook() {
             [[ -d "$wt_path" ]] || exit 0
             [[ "$wt_path" == *"/$WORKTREES_DIR/"* ]] || exit 0
 
-            if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
-                warn "Workspace has uncommitted changes — kept (use 'ws destroy' to remove it)" >&2
-                exit 0
-            fi
-
-            local root sname wt_branch
+            local root sname wt_branch=""
             root="${wt_path%%/$WORKTREES_DIR/*}"
             sname="$(basename "$wt_path")"
-            wt_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
+            _is_workspace_dir "$root" "$wt_path" || exit 0
+
+            if _is_live_worktree "$root" "$wt_path"; then
+                if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
+                    warn "Workspace has uncommitted changes — kept (use 'ws destroy' to remove it)" >&2
+                    exit 0
+                fi
+                wt_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
+            fi
             cd "$root"
             export WS_PROJECT="$(basename "$root")" WS_BRANCH="$wt_branch" WS_SITE="$sname" WS_DIR="$wt_path" WS_ROOT="$root"
             _run_hook "pre-destroy" "$root" >&2

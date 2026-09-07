@@ -182,7 +182,7 @@ ws destroy feature/auth --keep-db    # keeps the database
 ws destroy feature/auth --yes        # no confirmation prompt
 ```
 
-Deletes the worktree, local branch, database, Herd link(s), and SSL certificate if applicable. Use `--keep-db` to keep the database. The main project's database is never dropped.
+Deletes the worktree, local branch, database, Herd link(s), and SSL certificate if applicable. Use `--keep-db` to keep the database. Only databases named `<main database>_…` (the names `ws` creates) are ever dropped; a workspace `.env` pointing anywhere else is left alone. A stale directory (no git worktree behind it) is removed without touching any branch.
 
 ## Machine-readable output (`--json`)
 
@@ -351,7 +351,7 @@ Optional file at the repo root:
 | `terminal` | `tmux` \| `iterm` \| `terminal` \| `ghostty` \| `none` (default: auto). Env override: `WS_TERMINAL` |
 | `domain` | Env var holding the project's main host, patched to `<project>-<branch>.test` |
 | `subdomains` | Map of `prefix → env_var`. Each entry adds a `herd link` (`admin.<project>-<branch>.test`), patches the env var, is added to `SANCTUM_STATEFUL_DOMAINS`, and switches `SESSION_DOMAIN` to `.<project>-<branch>.test` so cookies span all hosts |
-| `files` | Gitignored files (relative to the repo root) symlinked from the main checkout into each workspace, so tooling that reads them by relative path (MCP servers, CLIs) keeps working. Existing files are left untouched; missing sources are skipped with a warning |
+| `files` | Gitignored files (relative to the repo root) symlinked from the main checkout into each workspace, so tooling that reads them by relative path (MCP servers, CLIs) keeps working. Existing files are left untouched; missing sources are skipped with a warning. Files `ws` provisions itself (`.env`, `.env.testing`, `phpunit.xml`, SQLite files, `storage`, `vendor`, `node_modules`) are refused |
 
 With `--secure`, each subdomain is also passed through `herd secure`. `ws destroy` cleans up every subdomain link as long as `.ws.json` is still present at the repo root.
 
