@@ -320,12 +320,12 @@ _ws_config_domain_env() {
 SUBDOMAINS_CACHE="" SUBDOMAINS_CACHE_ROOT=""
 _ws_config_subdomains() {
     local root="$1"
-    if [[ -n "$SUBDOMAINS_CACHE_ROOT" && "$SUBDOMAINS_CACHE_ROOT" == "$root" ]]; then
-        printf '%s' "$SUBDOMAINS_CACHE"
-        return 0
+    if [[ -z "$SUBDOMAINS_CACHE_ROOT" || "$SUBDOMAINS_CACHE_ROOT" != "$root" ]]; then
+        SUBDOMAINS_CACHE="$(_ws_config_subdomains_read "$root")" SUBDOMAINS_CACHE_ROOT="$root"
     fi
-    SUBDOMAINS_CACHE="$(_ws_config_subdomains_read "$root")" SUBDOMAINS_CACHE_ROOT="$root"
-    printf '%s' "$SUBDOMAINS_CACHE"
+    # $(...) strips the final newline: restore it so `read` sees the last entry
+    [[ -n "$SUBDOMAINS_CACHE" ]] && printf '%s\n' "$SUBDOMAINS_CACHE"
+    return 0
 }
 _ws_config_subdomains_read() {
     local root="$1"
@@ -2617,4 +2617,7 @@ main() {
     esac
 }
 
-main "$@"
+# Sourcing ws (tests) loads the functions without running a command
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
