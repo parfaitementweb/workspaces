@@ -17,6 +17,7 @@ ws status                         # list workspaces, dirty flag, DB / Herd state
 ws open feat/auth                 # (re)open the agent in a new tab
 ws run feat/auth -- --resume      # launch the agent here, pass args through
 ws preview feat/auth              # open http(s)://my-project-feat-auth.test
+ws preview feat/auth admin        # open a .ws.json subdomain: admin.my-project-feat-auth.test
 ws finish feat/auth               # PR / merge / abandon, then cleanup
 ws destroy feat/auth              # remove worktree, DB, Herd link, branch
 ```
@@ -33,7 +34,7 @@ Cheat sheet:
 | `ws open [branch] [--agent <cmd>] [-- args]` | Same, in a new terminal tab/window |
 | `ws status` | Overview of all workspaces |
 | `ws info [branch]` | One workspace: branch, base, commits ahead, URL, DB, test DB, Herd |
-| `ws preview [branch]` | Open the site in the browser |
+| `ws preview [branch] [subdomain]` | Open the site, or one of its `.ws.json` subdomains, in the browser |
 | `ws finish\|merge [branch] [--into <branch>] [--pr\|--merge\|--abandon] [--message\|-m <msg>] [--title <t>] [--cleanup]` | PR / merge / abandon against the base branch, guided or non-interactive |
 | `ws destroy <branch> [--keep-db] [--yes\|-y]` | Delete everything |
 | `ws hook create\|remove` | Adapter for Claude Code `WorktreeCreate` / `WorktreeRemove` hooks |
@@ -163,9 +164,11 @@ ws info                    # from a worktree
 ```bash
 ws preview feature/auth
 ws preview                 # from a worktree
+ws preview feature/auth admin   # the "admin" subdomain declared in .ws.json
+ws preview admin                # same, from a worktree
 ```
 
-Automatically detects whether the site is HTTP or HTTPS.
+Automatically detects whether the site is HTTP or HTTPS. The subdomain argument is a key of the `subdomains` map in `.ws.json`; the host opened is the one written in the workspace `.env`. An unknown key fails and lists the available ones. From a worktree, a single argument that matches a declared subdomain (and no existing workspace) is taken as the subdomain.
 
 ### Finish work
 
@@ -213,13 +216,19 @@ Exit codes: `0` success, or a confirmation declined at a prompt (nothing was don
   "ahead": 3,
   "profile": "laravel-herd",
   "url": "https://my-project-feature-auth.test",
+  "urls": [
+    { "url": "https://my-project-feature-auth.test" },
+    { "name": "admin", "url": "https://admin.my-project-feature-auth.test" }
+  ],
   "db": "my_project_feature_auth",
   "test_db": "test_my_project_feature_auth",
   "herd": true
 }
 ```
 
-`site`, `branch`, `path`, `base`, `dirty`, `ahead` (commits ahead of `base`) and `profile` are always present. `url`, `db`, `test_db` and `herd` are omitted, never `null`, when they do not apply: no `.env`, no test database, Herd not installed. `"stale": true` flags a directory left in `.worktrees/` without a git worktree behind it (`branch` is then `?`); `ws destroy` removes it.
+`site`, `branch`, `path`, `base`, `dirty`, `ahead` (commits ahead of `base`) and `profile` are always present. `url`, `urls`, `db`, `test_db` and `herd` are omitted, never `null`, when they do not apply: no `.env`, no test database, Herd not installed. `"stale": true` flags a directory left in `.worktrees/` without a git worktree behind it (`branch` is then `?`); `ws destroy` removes it.
+
+`urls` is the ordered list of preview URLs, present whenever `url` is. The first entry is the main URL (same value as `url`, no `name`); it is followed by one entry per key of the `subdomains` map in `.ws.json`, in file order, with `name` set to the key. Each subdomain URL is the host stored in the workspace `.env` under the mapped variable, with the protocol of the main URL; when the variable is missing (workspace created before the subdomain was declared) it falls back to `<name>.<site>.test`. The same array appears in the `ready` event of `ws create --json` and `ws setup --json`.
 
 ### `ws create <branch> --json`
 
@@ -460,6 +469,7 @@ Only Redis and Memcached are namespaced automatically. If you use another shared
 
 ## Changelog
 
+- **3.4.0** — Workspace records carry a `urls` array (main URL first, then one `{name, url}` per `.ws.json` subdomain, hosts read from the workspace `.env`); `ws status` and `ws info` list the resolved subdomain URLs; `ws preview [branch] <subdomain>` opens a subdomain and rejects unknown names; `ws preview` refuses unknown workspaces.
 - **3.3.1** — `storage/app` is cloned flat again (3.3.0 nested it under `storage/app/app` and dropped the tracked `.gitignore` files); the clone marker moves to `storage/app/.ws-cloned` so it no longer shows up as untracked; `destroy` kills the workspace's Vite again (the `.worktrees` match had lost its dot); the MySQL existence check no longer treats `_` as a wildcard; the PostgreSQL clone drops ownership and grants so `ON_ERROR_STOP` cannot abort it.
 - **3.3.0** — `.` is slugified like `/` and `_`; `--from origin/<branch>` records its base and sets no upstream; `create pr:N` refreshes a force-pushed PR; `finish --abandon` deletes the branch; `finish` refuses a detached HEAD; `setup` re-runs keep `.env`, `storage/app` and the database name; a separate repository under `.worktrees/` is never removed; MySQL passwords go through `MYSQL_PWD`; database and push failures name their cause; `sed` edits are portable and escape their values; JSON output escapes every control character.
 - **3.2.0** — `create`/`setup` close their stream with a `failed` event on any hard failure; existing databases are never cloned over; SQLite keeps `DB_DATABASE` and clones the file; `_` and `-` name the same workspace; Vite and `.env.testing` patches are `skip-worktree`; `destroy` lists uncommitted changes; `herd links` read once per command.
