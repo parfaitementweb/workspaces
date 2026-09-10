@@ -6,7 +6,7 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="3.3.1"
+VERSION="3.4.0"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
 MAX_LABEL_LEN=60
@@ -349,6 +349,14 @@ PY
 
 _ws_config_has_subdomains() {
     [[ -n "$(_ws_config_subdomains "$1")" ]]
+}
+
+_ws_config_has_subdomain() {
+    local root="$1" wanted="$2" prefix env_var
+    while IFS=: read -r prefix env_var; do
+        [[ "$prefix" == "$wanted" ]] && return 0
+    done < <(_ws_config_subdomains "$root")
+    return 1
 }
 
 # Emit one path per line from the .ws.json "files" array. Empty if absent.
@@ -718,6 +726,7 @@ _profile_is_plain() {
 _workspace_record() {
     local root="$1" sname="$2"
     local dir="$root/$WORKTREES_DIR/$sname"
+    WR_ROOT="$root"
     WR_SITE="$sname"
     WR_PATH="$dir"
     WR_STALE=""
@@ -750,11 +759,42 @@ _workspace_record() {
     fi
 }
 
+# Emit "<name>|<url>" lines: the main URL (empty name) first, then one line per
+# .ws.json subdomain in file order. Needs WR_PROFILE from _workspace_record.
+# Subdomain hosts come from the worktree .env; entries declared after the
+# workspace was created fall back to <prefix>.<site>.test.
+_workspace_urls() {
+    local root="$1" dir="$2" sname="$3"
+    _profile_is_plain "${WR_PROFILE:-}" && return 0
+    local main_url proto prefix env_var host
+    main_url="$(_get_env_var "$dir/.env" APP_URL)"
+    proto="$(site_protocol "$sname")"
+    [[ -n "$main_url" ]] || main_url="${proto}://${sname}.test"
+    [[ "$main_url" != *://* ]] || proto="${main_url%%://*}"
+    printf '|%s\n' "$main_url"
+    while IFS=: read -r prefix env_var; do
+        [[ -z "$prefix" || -z "$env_var" ]] && continue
+        host="$(_get_env_var "$dir/.env" "$env_var")"
+        [[ -n "$host" ]] || host="${prefix}.${sname}.test"
+        [[ "$host" == *://* ]] || host="${proto}://${host}"
+        printf '%s|%s\n' "$prefix" "$host"
+    done < <(_ws_config_subdomains "$root")
+}
+
 _workspace_json() {
-    local json
+    local json urls="" name url
     json="{\"site\":$(_json_str "$WR_SITE"),\"branch\":$(_json_str "$WR_BRANCH"),\"path\":$(_json_str "$WR_PATH")"
     json+=",\"base\":$(_json_str "$WR_BASE"),\"dirty\":$WR_DIRTY,\"ahead\":$WR_AHEAD,\"profile\":$(_json_str "$WR_PROFILE")"
     [[ -z "$WR_URL" ]]     || json+=",\"url\":$(_json_str "$WR_URL")"
+    if [[ -n "$WR_URL" ]]; then
+        while IFS='|' read -r name url; do
+            [[ -n "$url" ]] || continue
+            urls+="${urls:+,}{"
+            [[ -z "$name" ]] || urls+="\"name\":$(_json_str "$name"),"
+            urls+="\"url\":$(_json_str "$url")}"
+        done < <(_workspace_urls "$WR_ROOT" "$WR_PATH" "$WR_SITE")
+        [[ -z "$urls" ]] || json+=",\"urls\":[$urls]"
+    fi
     [[ -z "$WR_DB" ]]      || json+=",\"db\":$(_json_str "$WR_DB")"
     [[ -z "$WR_TEST_DB" ]] || json+=",\"test_db\":$(_json_str "$WR_TEST_DB")"
     [[ -z "$WR_HERD" ]]    || json+=",\"herd\":$WR_HERD"
@@ -1946,7 +1986,7 @@ cmd_status() {
 
     for sname in "${sites[@]}"; do
         _workspace_record "$root" "$sname"
-        local dirty_flag="" db_status herd_status url_display proto
+        local dirty_flag="" db_status herd_status url_display proto name url
         [[ "$WR_DIRTY" == "true" ]] && dirty_flag=" ${YELLOW}●${NC}"
         if [[ -n "$WR_DB" ]]; then db_status="${GREEN}✓${NC} DB"; else db_status="${DIM}– DB${NC}"; fi
         if [[ "$WR_HERD" == "true" ]]; then herd_status="${GREEN}✓${NC} Herd"; else herd_status="${DIM}– Herd${NC}"; fi
@@ -1963,10 +2003,10 @@ cmd_status() {
         fi
         echo -e "  ${BOLD}$WR_BRANCH${NC}${dirty_flag}  ${CYAN}+$WR_AHEAD${NC}  $db_status  $herd_status  ${DIM}→ $url_display${NC}"
 
-        while IFS=: read -r prefix env_var; do
-            [[ -z "$prefix" ]] && continue
-            echo -e "  ${DIM}└─ → ${proto}://${prefix}.${sname}.test${NC}"
-        done < <(_ws_config_subdomains "$root")
+        while IFS='|' read -r name url; do
+            [[ -n "$name" ]] || continue
+            echo -e "  ${DIM}└─ → ${url}${NC}"
+        done < <(_workspace_urls "$root" "$WR_PATH" "$sname")
     done
 
     echo ""
@@ -2001,6 +2041,11 @@ cmd_info() {
     echo -e "  ${BOLD}Branch${NC}    ${WR_BRANCH}  ${DIM}(from ${WR_BASE}, +${WR_AHEAD})${NC}$([[ "$WR_DIRTY" == "true" ]] && echo -e "  ${YELLOW}● uncommitted changes${NC}")"
     echo -e "  ${BOLD}Path${NC}      ${DIM}${WR_PATH}${NC}"
     [[ -n "$WR_URL" ]]     && echo -e "  ${BOLD}URL${NC}       ${CYAN}${WR_URL}${NC}"
+    local name url
+    while IFS='|' read -r name url; do
+        [[ -n "$name" ]] || continue
+        echo -e "            ${CYAN}${url}${NC}  ${DIM}(${name})${NC}"
+    done < <(_workspace_urls "$root" "$WR_PATH" "$sname")
     [[ -n "$WR_DB" ]]      && echo -e "  ${BOLD}Database${NC}  ${WR_DB}"
     [[ -n "$WR_TEST_DB" ]] && echo -e "  ${BOLD}Test DB${NC}   ${WR_TEST_DB}"
     [[ -n "$WR_HERD" ]]    && echo -e "  ${BOLD}Herd${NC}      $([[ "$WR_HERD" == "true" ]] && echo -e "${GREEN}linked${NC}" || echo -e "${DIM}not linked${NC}")"
@@ -2010,27 +2055,42 @@ cmd_info() {
 
 # ── PREVIEW ──
 
+# ws preview [branch] [subdomain]: inside a worktree a single argument that names
+# a declared subdomain (and no existing workspace) selects that subdomain.
 cmd_preview() {
-    local sname wt_path
+    local root sname wt_path prefix=""
+    root="$(find_project_root)"
 
-    if [[ -n "${1:-}" ]]; then
+    if [[ $# -ge 2 ]]; then
+        sname="$(resolve_site_name "$1")"
+        prefix="$2"
+    elif [[ -n "${1:-}" && ! -d "$root/$WORKTREES_DIR/$1" ]] && wt_path="$(detect_current_worktree)" && _ws_config_has_subdomain "$root" "$1"; then
+        sname="$(basename "$wt_path")"
+        prefix="$1"
+    elif [[ -n "${1:-}" ]]; then
         sname="$(resolve_site_name "$1")"
     elif wt_path="$(detect_current_worktree)"; then
         sname="$(basename "$wt_path")"
     else
-        fail "Usage: ws preview <branch-name> (or run from a worktree)"
+        fail "Usage: ws preview [branch] [subdomain] (or run from a worktree)"
     fi
+    [[ -d "$root/$WORKTREES_DIR/$sname" ]] || fail "Workspace '$sname' not found."
 
-    local root
-    root="$(find_project_root)"
     _workspace_record "$root" "$sname"
     _profile_is_plain "$WR_PROFILE" && fail "Workspace '$sname' is plain: no Herd site to open."
 
-    local proto
-    proto="$(site_protocol "$sname")"
-    local url="${proto}://$sname.test"
-    info "Opening $url..."
-    open "$url"
+    local name url target="" names=""
+    while IFS='|' read -r name url; do
+        [[ -z "$name" ]] || names+="${names:+, }$name"
+        [[ "$name" == "$prefix" ]] && target="$url"
+    done < <(_workspace_urls "$root" "$WR_PATH" "$sname")
+    if [[ -z "$target" ]]; then
+        [[ -n "$names" ]] || fail "Unknown subdomain '$prefix': no subdomains declared in .ws.json."
+        fail "Unknown subdomain '$prefix' for $sname. Available: $names"
+    fi
+
+    info "Opening $target..."
+    open "$target"
 }
 
 # ── FINISH ──
@@ -2517,7 +2577,7 @@ cmd_help() {
     echo -e "  ws open [branch] [--agent <cmd>] [-- args]  Same, in a new terminal tab/window"
     echo -e "  ws status                           Show all workspaces and their state"
     echo -e "  ws info [branch]                    Show one workspace"
-    echo -e "  ws preview [branch]                 Open the site in the browser"
+    echo -e "  ws preview [branch] [subdomain]     Open the site (or one of its .ws.json subdomains) in the browser"
     echo -e "  ws finish|merge [branch] [--into <branch>]  Finish work (PR / merge / abandon)"
     echo -e "      --into <branch>                 Target branch (default: the branch the workspace was created from)"
     echo -e "      --pr | --merge | --abandon      Skip the menu and every prompt"
@@ -2528,7 +2588,8 @@ cmd_help() {
     echo -e "  ws help                             Show this help"
     echo ""
     echo -e "${BOLD}Machine output:${NC}"
-    echo -e "  Add ${CYAN}--json${NC} to any command: status/info print records, create streams NDJSON steps,"
+    echo -e "  Add ${CYAN}--json${NC} to any command: status/info print records (with a \"urls\" array: main URL"
+    echo -e "  first, then one {name,url} per .ws.json subdomain), create streams NDJSON steps,"
     echo -e "  finish/destroy print one event and refuse to prompt. Errors are {\"error\":...} on stderr."
     echo -e "  WS_JSON=1 in the environment is equivalent. Exit codes: 0 success, 1 user error, 2 environment error."
     echo ""
@@ -2541,6 +2602,7 @@ cmd_help() {
     echo -e "  ws run feature/auth -- --resume       ${DIM}# pass args to the agent${NC}"
     echo -e "  ws open feature/auth --agent codex"
     echo -e "  ws status"
+    echo -e "  ws preview admin                      ${DIM}# from a worktree: open the admin subdomain${NC}"
     echo -e "  ws finish                             ${DIM}# guided workflow: PR, merge, or abandon${NC}"
     echo -e "  ws finish feature/auth --into develop ${DIM}# target develop instead of the recorded base${NC}"
     echo -e "  ws destroy feature/auth"

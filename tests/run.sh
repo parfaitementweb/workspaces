@@ -105,6 +105,96 @@ ENV
     assert_eq "bankhouse-feat-x.test,cp.bankhouse-feat-x.test" "$(_get_env_var "$wt/.env" SANCTUM_STATEFUL_DOMAINS)" "SANCTUM_STATEFUL_DOMAINS"
 }
 
+# Fake project: git repo with a main branch, .ws.json and one worktree under .worktrees/
+make_project() {
+    local name="$1" config="$2" sname="$3" root
+    root="$TMP/$name"
+    mkdir -p "$root"
+    git -C "$root" init -q
+    git -C "$root" symbolic-ref HEAD refs/heads/main
+    git -C "$root" -c user.name=ws -c user.email=ws@test commit -q --allow-empty -m init
+    printf '%s\n' "$config" > "$root/.ws.json"
+    git -C "$root" worktree add -q "$root/.worktrees/$sname" -b "feat-$name" 2>/dev/null
+    echo "$root"
+}
+
+status_json() {
+    (cd "$1" && WS_JSON="" bash "$WS_BIN" status --json 2>/dev/null)
+}
+
+urls_member() {
+    sed -n 's/.*\("urls":\[[^]]*\]\).*/\1/p'
+}
+
+case_workspace_urls_reads_env_hosts() {
+    local root dir
+    root="$(make_root urls-env '{"domain": "APP_DOMAIN", "subdomains": {"cp": "FILAMENT_DOMAIN", "api": "API_DOMAIN"}}')"
+    dir="$TMP/urls-env-wt"
+    mkdir -p "$dir"
+    cat > "$dir/.env" <<'ENV'
+APP_URL=https://bankhouse-feat-x.test
+APP_DOMAIN=bankhouse-feat-x.test
+FILAMENT_DOMAIN=cp.bankhouse-feat-x.test
+API_DOMAIN="api.bankhouse-feat-x.test"
+ENV
+    WR_PROFILE="$PROFILE_LARAVEL"
+    assert_eq "$(printf '|https://bankhouse-feat-x.test\ncp|https://cp.bankhouse-feat-x.test\napi|https://api.bankhouse-feat-x.test')" \
+        "$(_workspace_urls "$root" "$dir" "bankhouse-feat-x")" "lines"
+}
+
+case_workspace_urls_falls_back_without_env_var() {
+    local root dir
+    root="$(make_root urls-fallback '{"subdomains": {"cp": "FILAMENT_DOMAIN"}}')"
+    dir="$TMP/urls-fallback-wt"
+    mkdir -p "$dir"
+    echo 'APP_URL=http://bankhouse-feat-x.test' > "$dir/.env"
+    WR_PROFILE="$PROFILE_LARAVEL"
+    assert_eq "$(printf '|http://bankhouse-feat-x.test\ncp|http://cp.bankhouse-feat-x.test')" \
+        "$(_workspace_urls "$root" "$dir" "bankhouse-feat-x")" "lines"
+}
+
+case_workspace_urls_plain_emits_nothing() {
+    local root dir
+    root="$(make_root urls-plain '{"subdomains": {"cp": "FILAMENT_DOMAIN"}}')"
+    dir="$TMP/urls-plain-wt"
+    mkdir -p "$dir"
+    echo 'APP_URL=http://bankhouse-feat-x.test' > "$dir/.env"
+    WR_PROFILE="$PROFILE_PLAIN"
+    assert_eq "" "$(_workspace_urls "$root" "$dir" "bankhouse-feat-x")" "output"
+}
+
+case_status_json_urls_with_env_var() {
+    local root sname="ws-test-json-env" out
+    root="$(make_project json-env '{"profile": "laravel-herd", "domain": "APP_DOMAIN", "subdomains": {"cp": "FILAMENT_DOMAIN"}}' "$sname")"
+    cat > "$root/.worktrees/$sname/.env" <<ENV
+APP_URL=http://$sname.test
+APP_DOMAIN=$sname.test
+FILAMENT_DOMAIN=cp.$sname.test
+ENV
+    out="$(status_json "$root")"
+    assert_eq "\"urls\":[{\"url\":\"http://$sname.test\"},{\"name\":\"cp\",\"url\":\"http://cp.$sname.test\"}]" \
+        "$(printf '%s' "$out" | urls_member)" "urls member"
+    assert_eq 1 "$(printf '%s' "$out" | grep -c "\"url\":\"http://$sname.test\",\"urls\"")" "url kept before urls"
+}
+
+case_status_json_urls_without_env_var() {
+    local root sname="ws-test-json-fallback" out
+    root="$(make_project json-fallback '{"profile": "laravel-herd", "subdomains": {"cp": "FILAMENT_DOMAIN", "api": "API_DOMAIN"}}' "$sname")"
+    echo "APP_URL=http://$sname.test" > "$root/.worktrees/$sname/.env"
+    out="$(status_json "$root")"
+    assert_eq "\"urls\":[{\"url\":\"http://$sname.test\"},{\"name\":\"cp\",\"url\":\"http://cp.$sname.test\"},{\"name\":\"api\",\"url\":\"http://api.$sname.test\"}]" \
+        "$(printf '%s' "$out" | urls_member)" "urls member"
+}
+
+case_status_json_plain_has_no_urls() {
+    local root sname="ws-test-json-plain" out
+    root="$(make_project json-plain '{"profile": "plain", "subdomains": {"cp": "FILAMENT_DOMAIN"}}' "$sname")"
+    echo "APP_URL=http://$sname.test" > "$root/.worktrees/$sname/.env"
+    out="$(status_json "$root")"
+    assert_eq 1 "$(printf '%s' "$out" | grep -c '"profile":"plain"')" "plain record"
+    assert_eq 0 "$(printf '%s' "$out" | grep -c '"url')" "no url or urls"
+}
+
 run_case() {
     local name="$1" rc
     set +e
@@ -125,6 +215,12 @@ run_case case_two_subdomains_read_loop
 run_case case_has_subdomains
 run_case case_no_subdomains_emits_nothing
 run_case case_setup_env_single_subdomain
+run_case case_workspace_urls_reads_env_hosts
+run_case case_workspace_urls_falls_back_without_env_var
+run_case case_workspace_urls_plain_emits_nothing
+run_case case_status_json_urls_with_env_var
+run_case case_status_json_urls_without_env_var
+run_case case_status_json_plain_has_no_urls
 
 echo "$PASSED passed, $FAILED failed"
 [[ $FAILED -eq 0 ]]
