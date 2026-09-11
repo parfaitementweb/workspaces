@@ -100,7 +100,7 @@ Everything is handled automatically:
 - Clones the database (`myproject_feature_auth`) from the main one — PostgreSQL `TEMPLATE`, `mysqldump`, or SQLite file copy — then runs migrations. `--fresh` creates an empty DB and runs migrations + seeders instead. A database that already exists under that name is kept as is (migrations only). SQLite keeps `DB_DATABASE` untouched: the file (default `database/database.sqlite`, relative to the worktree) is copied, an absolute path is left alone
 - Isolates the test database (`test_myproject_feature_auth`): copies `.env.testing`, creates an empty DB, and points `phpunit.xml` at it so suites can run in parallel with the main repo without deadlocking
 - Clones `storage/app` (uploads) and runs `storage:link`
-- Copies `.claude/settings.local.json` and `CLAUDE.local.md` so agent permissions carry over
+- Copies `.claude/settings.local.json`, `CLAUDE.local.md`, and `.codex/config.toml` from the main project when present, creating parent directories as needed and preserving existing workspace files, so agent permissions, instructions, and MCP settings carry over
 - Symlinks the gitignored files listed under `"files"` in `.ws.json` (local MCP configs, credentials...) to the main checkout
 - Links with Herd → `http(s)://my-project-feature-auth.test`
 - Patches Vite config (`host: 'localhost'`, `cors: true`, `port: Number(process.env.VITE_PORT) || 5173`) — commit that change once on your base branch so future workspaces start clean
@@ -307,7 +307,9 @@ Polyscope clones the whole project folder with copy-on-write and runs a setup sc
 
 ### Other agents
 
-Nothing in `ws` is Claude-specific except the default agent name. `ws run --agent codex`, `WS_AGENT=cursor-agent`, or `"agent": "..."` in `.ws.json`.
+Use any agent CLI with `ws run --agent codex`, `WS_AGENT=cursor-agent`, or `"agent": "..."` in `.ws.json`. Claude Code is the default.
+
+Both `ws create` and `ws setup` copy local Claude files and `.codex/config.toml` from the main checkout, including Codex MCP server declarations that are not tracked by Git. Missing source files are skipped; existing workspace files are never overwritten. This applies to both the Laravel and plain profiles.
 
 ## Hooks
 
@@ -356,7 +358,7 @@ Don't forget `chmod +x .ws/hooks/post-create`. Hooks are optional — if a file 
 | Profile | What `ws create` does |
 |---|---|
 | `laravel-herd` | Everything described above: `.env` patched, dependencies cloned, database cloned, test database isolated, Herd link, Vite port, caches cleared |
-| `plain` | Worktree, `.env` copied as is (only when the workspace has none and the main checkout has one), `.claude/settings.local.json` / `CLAUDE.local.md` copied, `"files"` symlinked, `vendor/` and `node_modules/` cloned copy-on-write (or installed) when `composer.json` / `package.json` exist, `.ws/hooks/` hooks. No database, no test database, no storage clone, no Herd, no Vite patch, no cache clear |
+| `plain` | Worktree, `.env` copied as is (only when the workspace has none and the main checkout has one), `.claude/settings.local.json` / `CLAUDE.local.md` / `.codex/config.toml` copied when present in the main checkout and absent from the workspace, `"files"` symlinked, `vendor/` and `node_modules/` cloned copy-on-write (or installed) when `composer.json` / `package.json` exist, `.ws/hooks/` hooks. No database, no test database, no storage clone, no Herd, no Vite patch, no cache clear |
 
 The profile is resolved once per command: `--plain` flag (`ws create`, `ws setup`), then the profile the workspace was provisioned with (recorded in `git config branch.<name>.ws-profile`, next to its base branch), then `"profile"` in `.ws.json`, then detection (`artisan` present → `laravel-herd`, otherwise `plain`). An unknown value is reported and replaced by detection. Hooks receive it as `WS_PROFILE`. `ws status`, `ws finish` and `ws destroy` read the recorded profile, so a workspace created with `--plain` stays plain for its whole life: it is torn down without touching any database or Herd site, and its JSON record carries `"profile": "plain"` and none of the `url`, `db`, `test_db`, `herd` fields. `--secure` and `--fresh` are ignored, with a warning, for plain workspaces, and `ws preview` refuses them.
 
