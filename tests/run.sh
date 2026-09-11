@@ -105,6 +105,44 @@ ENV
     assert_eq "bankhouse-feat-x.test,cp.bankhouse-feat-x.test" "$(_get_env_var "$wt/.env" SANCTUM_STATEFUL_DOMAINS)" "SANCTUM_STATEFUL_DOMAINS"
 }
 
+case_setup_agent_files_copies_configs() {
+    local root wt f
+    root="$(make_root agent-copy-root)"
+    wt="$TMP/agent-copy-wt"
+    mkdir -p "$root/.claude" "$root/.codex" "$wt"
+    echo '{"permissions": {"allow": []}}' > "$root/.claude/settings.local.json"
+    echo 'Local agent instructions' > "$root/CLAUDE.local.md"
+    printf '%s\n' '[mcp_servers.db-prod]' 'command = "example-mcp"' > "$root/.codex/config.toml"
+    (cd "$wt" && _setup_agent_files "$root" > /dev/null) || return 1
+    for f in .claude/settings.local.json CLAUDE.local.md .codex/config.toml; do
+        cmp "$root/$f" "$wt/$f" || return 1
+    done
+}
+
+case_setup_agent_files_without_source() {
+    local root wt
+    root="$(make_root agent-missing-root)"
+    wt="$TMP/agent-missing-wt"
+    mkdir -p "$wt"
+    (cd "$wt" && _setup_agent_files "$root" > /dev/null) || return 1
+    if [[ -e "$wt/.codex" || -e "$wt/.claude" || -e "$wt/CLAUDE.local.md" ]]; then
+        echo "    absent sources: expected no agent files or parent directories"
+        return 1
+    fi
+}
+
+case_setup_agent_files_preserves_existing_config() {
+    local root wt
+    root="$(make_root agent-existing-root)"
+    wt="$TMP/agent-existing-wt"
+    mkdir -p "$root/.codex" "$wt/.codex"
+    printf '%s\n' '[mcp_servers.db-prod]' 'command = "main-mcp"' > "$root/.codex/config.toml"
+    printf '%s\n' '[mcp_servers.db-local]' 'command = "workspace-mcp"' > "$TMP/agent-existing-expected.toml"
+    cp "$TMP/agent-existing-expected.toml" "$wt/.codex/config.toml"
+    (cd "$wt" && _setup_agent_files "$root" > /dev/null) || return 1
+    cmp "$TMP/agent-existing-expected.toml" "$wt/.codex/config.toml"
+}
+
 # Fake project: git repo with a main branch, .ws.json and one worktree under .worktrees/
 make_project() {
     local name="$1" config="$2" sname="$3" root
@@ -215,6 +253,9 @@ run_case case_two_subdomains_read_loop
 run_case case_has_subdomains
 run_case case_no_subdomains_emits_nothing
 run_case case_setup_env_single_subdomain
+run_case case_setup_agent_files_copies_configs
+run_case case_setup_agent_files_without_source
+run_case case_setup_agent_files_preserves_existing_config
 run_case case_workspace_urls_reads_env_hosts
 run_case case_workspace_urls_falls_back_without_env_var
 run_case case_workspace_urls_plain_emits_nothing

@@ -6,7 +6,7 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="3.4.0"
+VERSION="3.4.1"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
 MAX_LABEL_LEN=60
@@ -1340,12 +1340,12 @@ _setup_env() {
     success ".env configured (APP_URL=${proto}://${sname}.test)"
 }
 
-# Carry over local (gitignored) agent config so permissions/instructions survive in the workspace
+# Carry over local (gitignored) agent config so permissions/instructions/MCP settings survive in the workspace
 _setup_agent_files() {
     local root="$1"
     [[ -n "$root" ]] || return 0
     local f
-    for f in .claude/settings.local.json CLAUDE.local.md; do
+    for f in .claude/settings.local.json CLAUDE.local.md .codex/config.toml; do
         if [[ -f "$root/$f" && ! -f "$f" ]]; then
             mkdir -p "$(dirname "$f")"
             cp "$root/$f" "$f" && success "$f copied from main project" || warn "$f could not be copied"
