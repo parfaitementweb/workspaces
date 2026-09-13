@@ -6,7 +6,7 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="3.4.1"
+VERSION="3.5.0"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
 MAX_LABEL_LEN=60
@@ -373,6 +373,30 @@ try:
     for f in (json.load(open(sys.argv[1])).get("files") or []):
         if isinstance(f, str) and f:
             print(f)
+except Exception:
+    pass
+PY
+    fi
+}
+
+# Read the "build" value from .ws.json: "false" or "true" for booleans, the command for a string, empty if absent
+_ws_config_build() {
+    local root="$1"
+    local config="$root/.ws.json"
+    [[ -n "$root" && -f "$config" ]] || return 0
+    if command -v jq &>/dev/null; then
+        jq -r 'if has("build") then .build else empty end | if type == "boolean" then tostring elif type == "string" then . else empty end' "$config" 2>/dev/null || true
+    elif command -v python3 &>/dev/null; then
+        python3 - "$config" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    if "build" in d:
+        v = d["build"]
+        if isinstance(v, bool):
+            print("true" if v else "false")
+        elif isinstance(v, str):
+            print(v)
 except Exception:
     pass
 PY
@@ -912,15 +936,16 @@ EOF
 # ── CREATE ──
 
 cmd_create() {
-    local branch_name="" secure="" fresh="" open_after="" agent_flag="" from_flag="" profile_flag=""
+    local branch_name="" secure="" fresh="" no_build="" open_after="" agent_flag="" from_flag="" profile_flag=""
     local -a agent_args=()
 
     while (( $# )); do
         case "$1" in
-            --secure)  secure="--secure" ;;
-            --fresh)   fresh="--fresh" ;;
-            --plain)   profile_flag="$PROFILE_PLAIN" ;;
-            --open)    open_after="1" ;;
+            --secure)   secure="--secure" ;;
+            --fresh)    fresh="--fresh" ;;
+            --no-build) no_build="1" ;;
+            --plain)    profile_flag="$PROFILE_PLAIN" ;;
+            --open)     open_after="1" ;;
             --from)    from_flag="${2:-}"; shift ;;
             --from=*)  from_flag="${1#--from=}" ;;
             --agent)   agent_flag="${2:-}"; shift ;;
@@ -935,14 +960,14 @@ cmd_create() {
         shift
     done
 
-    [[ -n "$branch_name" ]] || fail "Usage: ws create <branch-name|pr:NUMBER> [--from <branch>] [--secure] [--fresh] [--plain] [--open] [--agent <cmd>]"
+    [[ -n "$branch_name" ]] || fail "Usage: ws create <branch-name|pr:NUMBER> [--from <branch>] [--secure] [--fresh] [--no-build] [--plain] [--open] [--agent <cmd>]"
 
     local root
     root="$(find_project_root)"
     trap _on_provision_exit EXIT
     resolve_profile "$root" "$profile_flag" >/dev/null
-    if _profile_is_plain && [[ -n "$secure$fresh" ]]; then
-        warn "--secure and --fresh have no effect with the plain profile"
+    if _profile_is_plain && [[ -n "$secure$fresh$no_build" ]]; then
+        warn "--secure, --fresh and --no-build have no effect with the plain profile"
     fi
 
     # PR checkout mode: ws create pr:123 → fetch pull/123/head into pr-123, then use it
@@ -1006,7 +1031,7 @@ cmd_create() {
     emit_step worktree done
     WS_CREATED_SITE="$sname"
 
-    _provision "$root" "$branch_name" "$sname" "$wt_path" "$secure" "$fresh"
+    _provision "$root" "$branch_name" "$sname" "$wt_path" "$secure" "$fresh" "$no_build"
     WS_DONE="1"
     if [[ -n "$WS_JSON" ]]; then
         _workspace_record "$root" "$sname"
@@ -1046,12 +1071,13 @@ _on_provision_exit() {
 # ── SETUP (provision the current directory as a workspace) ──
 
 cmd_setup() {
-    local secure="" fresh="" source_root="" name_override="" standalone="" profile_flag=""
+    local secure="" fresh="" no_build="" source_root="" name_override="" standalone="" profile_flag=""
 
     while (( $# )); do
         case "$1" in
             --secure)     secure="--secure" ;;
             --fresh)      fresh="--fresh" ;;
+            --no-build)   no_build="1" ;;
             --plain)      profile_flag="$PROFILE_PLAIN" ;;
             --from)       source_root="${2:-}"; shift ;;
             --from=*)     source_root="${1#--from=}" ;;
@@ -1095,14 +1121,14 @@ cmd_setup() {
     fi
 
     resolve_profile "${source_root:-$wt_path}" "$profile_flag" "$branch_name" >/dev/null
-    if _profile_is_plain && [[ -n "$secure$fresh" ]]; then
-        warn "--secure and --fresh have no effect with the plain profile"
+    if _profile_is_plain && [[ -n "$secure$fresh$no_build" ]]; then
+        warn "--secure, --fresh and --no-build have no effect with the plain profile"
     fi
     header "Provisioning workspace: $sname ($WS_PROFILE)"
     [[ -n "$source_root" ]] && info "Source: $source_root"
 
     trap _on_provision_exit EXIT
-    _provision "$source_root" "$branch_name" "$sname" "$wt_path" "$secure" "$fresh"
+    _provision "$source_root" "$branch_name" "$sname" "$wt_path" "$secure" "$fresh" "$no_build"
     WS_DONE="1"
     if [[ -n "$WS_JSON" ]]; then
         emit_event ready "\"site\":$(_json_str "$sname"),\"branch\":$(_json_str "$branch_name"),\"path\":$(_json_str "$wt_path")"
@@ -1131,7 +1157,7 @@ _resolve_source_root() {
 # ── PROVISION (shared by create and setup) ──
 
 _provision() {
-    local root="$1" branch_name="$2" sname="$3" wt_path="$4" secure="${5:-}" fresh="${6:-}"
+    local root="$1" branch_name="$2" sname="$3" wt_path="$4" secure="${5:-}" fresh="${6:-}" no_build="${7:-}"
 
     local proto
     proto="$(site_protocol "$sname")"
@@ -1180,6 +1206,9 @@ _provision() {
     emit_step vite running
     _setup_vite
     emit_step vite done
+    emit_step assets running
+    _setup_assets "$root" "$no_build"
+    emit_step assets done
     emit_step caches running
     _clear_cache
     emit_step caches done
@@ -1814,6 +1843,68 @@ _setup_vite() {
     if [[ -n "$patched" ]]; then
         _skip_worktree "$vite_config"
         warn "$vite_config was patched in this workspace (kept out of diffs and commits) — apply the same change on your base branch once so future workspaces start clean"
+    fi
+}
+
+# True when package.json declares the given npm script
+_package_has_script() {
+    local name="$1"
+    [[ -f "package.json" ]] || return 1
+    if command -v jq &>/dev/null; then
+        jq -e --arg n "$name" '.scripts[$n] | type == "string"' package.json >/dev/null 2>&1
+    elif command -v python3 &>/dev/null; then
+        python3 -c 'import json,sys; sys.exit(0 if isinstance((json.load(open("package.json")).get("scripts") or {}).get(sys.argv[1]), str) else 1)' "$name" 2>/dev/null
+    else
+        grep -Eq "\"${name}\"[[:space:]]*:" package.json 2>/dev/null
+    fi
+}
+
+# The command that builds the front assets, or nothing when the project has none to build:
+# .ws.json "build" wins (false disables, a string replaces the command), then detection
+# (package.json build script + Vite + node_modules present).
+_assets_build_command() {
+    local root="${1:-}" configured
+    configured="$(_ws_config_build "$root")"
+    case "$configured" in
+        false) return 0 ;;
+        ""|true) ;;
+        *) printf '%s\n' "$configured"; return 0 ;;
+    esac
+    _package_has_script build || return 0
+    [[ -n "$(ls vite.config.* 2>/dev/null)" ]] || grep -q '"laravel-vite-plugin"' package.json 2>/dev/null || return 0
+    [[ -d "node_modules" ]] || return 0
+    echo "npm run build"
+}
+
+# Build the front assets once, so public/build/manifest.json exists. Never fails the provisioning.
+_setup_assets() {
+    local root="${1:-}" no_build="${2:-}"
+    [[ -f "package.json" ]] || return 0
+    if [[ -n "$no_build" ]]; then
+        info "Asset build skipped (--no-build)"
+        return 0
+    fi
+    if [[ "$(_ws_config_build "$root")" == "false" ]]; then
+        info "Asset build disabled by .ws.json"
+        return 0
+    fi
+    if [[ -f "public/hot" ]]; then
+        info "Vite dev server detected (public/hot) — skipping asset build"
+        return 0
+    fi
+    local cmd
+    cmd="$(_assets_build_command "$root")"
+    [[ -n "$cmd" ]] || return 0
+    if [[ "$cmd" == "npm run build" && -f "public/build/manifest.json" ]]; then
+        success "Assets already built"
+        return 0
+    fi
+    info "Building assets ($cmd)..."
+    local out
+    if out="$(bash -c "$cmd" 2>&1)"; then
+        success "Assets built"
+    else
+        warn "Asset build failed — run '$cmd' manually ($(_last_line "$out"))"
     fi
 }
 
@@ -2568,10 +2659,11 @@ cmd_help() {
     echo -e "      --from <branch>                 Branch to start from (default: repo default branch)"
     echo -e "      --secure                        HTTPS via herd secure"
     echo -e "      --fresh                         Empty DB + migrate + seed (default: clone main DB)"
+    echo -e "      --no-build                      Skip the front asset build (default: npm run build when Vite is used)"
     echo -e "      --plain                         Worktree + deps only, no DB, Herd or Vite (auto on non-Laravel repos)"
     echo -e "      --open                          Open the agent in a new terminal tab when ready"
     echo -e "      --agent <cmd> [-- args]         Agent to launch (default: claude)"
-    echo -e "  ws setup [--from <repo>] [--name <site>] [--secure] [--fresh] [--plain] [--standalone]"
+    echo -e "  ws setup [--from <repo>] [--name <site>] [--secure] [--fresh] [--no-build] [--plain] [--standalone]"
     echo -e "                                      Provision the current checkout as a workspace"
     echo -e "  ws run [branch] [--agent <cmd>] [-- args]   Launch the agent in the workspace"
     echo -e "  ws open [branch] [--agent <cmd>] [-- args]  Same, in a new terminal tab/window"
@@ -2618,8 +2710,9 @@ cmd_help() {
     echo -e "${BOLD}Config (.ws.json at repo root):${NC}"
     echo -e "  ${DIM}{ \"agent\": \"claude\", \"terminal\": \"iterm\", \"profile\": \"laravel-herd\",${NC}"
     echo -e "  ${DIM}  \"domain\": \"APP_DOMAIN\", \"subdomains\": { \"admin\": \"FILAMENT_DOMAIN\" },${NC}"
-    echo -e "  ${DIM}  \"files\": [\"db-prod.toml\"] }${NC}"
+    echo -e "  ${DIM}  \"files\": [\"db-prod.toml\"], \"build\": false }${NC}"
     echo -e "  files: ${DIM}gitignored files symlinked from the main checkout into each workspace${NC}"
+    echo -e "  build: ${DIM}false | \"<command>\" (default: npm run build when package.json has a build script and Vite is used)${NC}"
     echo -e "  terminal: ${DIM}tmux | iterm | terminal | ghostty | none${NC} (auto-detected by default)"
     echo -e "  Env overrides: ${DIM}WS_AGENT, WS_TERMINAL, WS_SOURCE, WS_JSON${NC}"
     echo ""

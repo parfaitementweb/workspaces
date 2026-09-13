@@ -1,6 +1,6 @@
 ---
 description: Create an isolated workspace (worktree + Herd + DB) and open a new agent session in it
-argument-hint: <branch|pr:N> [--from <branch>] [--secure] [--fresh] [--plain] [--agent <cmd>] [-- <agent args>]
+argument-hint: <branch|pr:N> [--from <branch>] [--secure] [--fresh] [--no-build] [--plain] [--agent <cmd>] [-- <agent args>]
 allowed-tools: Bash(ws:*)
 ---
 
