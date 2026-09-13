@@ -28,8 +28,8 @@ Cheat sheet:
 
 | Command | What it does |
 |---|---|
-| `ws create <branch\|pr:N> [--from <branch>] [--secure] [--fresh] [--plain] [--open] [--agent <cmd> -- args]` | Create a workspace (base branch, HTTPS, empty DB, no Laravel steps, open agent, other agent) |
-| `ws setup [--from <repo>] [--name <site>] [--secure] [--fresh] [--plain] [--standalone]` | Provision the current checkout (worktree, Polyscope clone...) |
+| `ws create <branch\|pr:N> [--from <branch>] [--secure] [--fresh] [--no-build] [--plain] [--open] [--agent <cmd> -- args]` | Create a workspace (base branch, HTTPS, empty DB, no asset build, no Laravel steps, open agent, other agent) |
+| `ws setup [--from <repo>] [--name <site>] [--secure] [--fresh] [--no-build] [--plain] [--standalone]` | Provision the current checkout (worktree, Polyscope clone...) |
 | `ws run [branch] [--agent <cmd>] [-- args]` | Launch the agent in the workspace |
 | `ws open [branch] [--agent <cmd>] [-- args]` | Same, in a new terminal tab/window |
 | `ws status` | Overview of all workspaces |
@@ -86,6 +86,7 @@ ws create feature/auth --open     # ...and open the agent in a new terminal tab 
 ws create feature/auth --secure   # HTTPS (herd secure)
 ws create feature/auth --fresh    # empty DB + migrate + seed instead of cloning the main DB
 ws create feature/auth --from develop   # branch off develop instead of the default branch
+ws create feature/auth --no-build  # skip the front asset build
 ws create pr:42                   # check out GitHub PR #42 in a worktree
 ws create feature/auth --open --agent codex -- --model o3   # other agent, extra args after --
 ```
@@ -104,6 +105,7 @@ Everything is handled automatically:
 - Symlinks the gitignored files listed under `"files"` in `.ws.json` (local MCP configs, credentials...) to the main checkout
 - Links with Herd → `http(s)://my-project-feature-auth.test`
 - Patches Vite config (`host: 'localhost'`, `cors: true`, `port: Number(process.env.VITE_PORT) || 5173`) — commit that change once on your base branch so future workspaces start clean
+- Builds the front assets (`npm run build`) when `package.json` has a `build` script, Vite is used (`vite.config.*` or `laravel-vite-plugin`) and `node_modules/` is available, so `public/build/manifest.json` exists and pages render right away. Skipped when `public/hot` exists (dev server running) or the manifest is already there; a failed build is reported and never blocks the workspace. `--no-build` skips it once, `"build": false` in `.ws.json` always, `"build": "<command>"` replaces the command
 - Clears Laravel caches
 - Runs your `pre-create` / `post-create` hooks
 
@@ -252,7 +254,7 @@ Every stdout line is one JSON object of one of these shapes:
 | `{"event": "ready", "workspace": <record>}` | Last line on success |
 | `{"event": "failed", "step": S, "message": M}` | Last line on a hard failure, followed by a non-zero exit. Once the worktree exists, `message` names the `ws destroy` command that cleans up |
 
-Step order, `laravel-herd` profile: `worktree`, `hooks` (pre-create), `env`, `deps`, `db`, `test_db`, `storage`, `herd`, `vite`, `caches`, `hooks` (post-create). `plain` profile: `worktree`, `hooks` (pre-create), `env`, `deps`, `hooks` (post-create). Provisioning steps that degrade gracefully (missing tool, DB clone fallback) stay `done` and explain themselves on stderr. Errors are never on stdout: a stream that ends without `ready` nor `failed` (tool killed) must be read as a failure from the exit code.
+Step order, `laravel-herd` profile: `worktree`, `hooks` (pre-create), `env`, `deps`, `db`, `test_db`, `storage`, `herd`, `vite`, `assets`, `caches`, `hooks` (post-create). `plain` profile: `worktree`, `hooks` (pre-create), `env`, `deps`, `hooks` (post-create). Provisioning steps that degrade gracefully (missing tool, DB clone fallback) stay `done` and explain themselves on stderr. Errors are never on stdout: a stream that ends without `ready` nor `failed` (tool killed) must be read as a failure from the exit code.
 
 ### `ws setup --json`
 
@@ -357,8 +359,8 @@ Don't forget `chmod +x .ws/hooks/post-create`. Hooks are optional — if a file 
 
 | Profile | What `ws create` does |
 |---|---|
-| `laravel-herd` | Everything described above: `.env` patched, dependencies cloned, database cloned, test database isolated, Herd link, Vite port, caches cleared |
-| `plain` | Worktree, `.env` copied as is (only when the workspace has none and the main checkout has one), `.claude/settings.local.json` / `CLAUDE.local.md` / `.codex/config.toml` copied when present in the main checkout and absent from the workspace, `"files"` symlinked, `vendor/` and `node_modules/` cloned copy-on-write (or installed) when `composer.json` / `package.json` exist, `.ws/hooks/` hooks. No database, no test database, no storage clone, no Herd, no Vite patch, no cache clear |
+| `laravel-herd` | Everything described above: `.env` patched, dependencies cloned, database cloned, test database isolated, Herd link, Vite port, assets built, caches cleared |
+| `plain` | Worktree, `.env` copied as is (only when the workspace has none and the main checkout has one), `.claude/settings.local.json` / `CLAUDE.local.md` / `.codex/config.toml` copied when present in the main checkout and absent from the workspace, `"files"` symlinked, `vendor/` and `node_modules/` cloned copy-on-write (or installed) when `composer.json` / `package.json` exist, `.ws/hooks/` hooks. No database, no test database, no storage clone, no Herd, no Vite patch, no asset build, no cache clear |
 
 The profile is resolved once per command: `--plain` flag (`ws create`, `ws setup`), then the profile the workspace was provisioned with (recorded in `git config branch.<name>.ws-profile`, next to its base branch), then `"profile"` in `.ws.json`, then detection (`artisan` present → `laravel-herd`, otherwise `plain`). An unknown value is reported and replaced by detection. Hooks receive it as `WS_PROFILE`. `ws status`, `ws finish` and `ws destroy` read the recorded profile, so a workspace created with `--plain` stays plain for its whole life: it is torn down without touching any database or Herd site, and its JSON record carries `"profile": "plain"` and none of the `url`, `db`, `test_db`, `herd` fields. `--secure` and `--fresh` are ignored, with a warning, for plain workspaces, and `ws preview` refuses them.
 
@@ -375,7 +377,8 @@ Optional file at the repo root:
     "admin": "FILAMENT_DOMAIN",
     "api": "API_DOMAIN"
   },
-  "files": ["db-prod.toml", ".mcp.local.json"]
+  "files": ["db-prod.toml", ".mcp.local.json"],
+  "build": false
 }
 ```
 
@@ -387,6 +390,7 @@ Optional file at the repo root:
 | `domain` | Env var holding the project's main host, patched to `<project>-<branch>.test` |
 | `subdomains` | Map of `prefix → env_var`. Each entry adds a `herd link` (`admin.<project>-<branch>.test`), patches the env var, is added to `SANCTUM_STATEFUL_DOMAINS`, and switches `SESSION_DOMAIN` to `.<project>-<branch>.test` so cookies span all hosts |
 | `files` | Gitignored files (relative to the repo root) symlinked from the main checkout into each workspace, so tooling that reads them by relative path (MCP servers, CLIs) keeps working. Existing files are left untouched; missing sources and paths that are not gitignored are skipped with a warning. Files `ws` provisions itself (`.env`, `.env.testing`, `phpunit.xml`, SQLite files, `storage`, `vendor`, `node_modules`) are refused |
+| `build` | `false` disables the front asset build for the project; a string (`"pnpm build"`, `"npm run build -- --mode staging"`) replaces the default `npm run build` and runs as is, without detection. Default: `npm run build` when `package.json` has a `build` script, Vite is used and `node_modules/` is available |
 
 With `--secure`, each subdomain is also passed through `herd secure`. `ws destroy` cleans up every subdomain link as long as `.ws.json` is still present at the repo root.
 
@@ -460,6 +464,9 @@ rm -f public/hot
 npm run dev
 ```
 
+### Vite manifest not found
+The asset build was skipped (`--no-build`, `"build": false`, no `build` script, no `node_modules/`) or failed: read the `ws create` output, then run `npm run build` in the workspace (or `npm run dev` for a dev server).
+
 ### Migrations failed
 The worktree database might not exist. Check `DB_DATABASE` in `.env` and create the database manually if needed.
 
@@ -471,6 +478,7 @@ Only Redis and Memcached are namespaced automatically. If you use another shared
 
 ## Changelog
 
+- **3.5.0** — `ws create` and `ws setup` build the front assets (`npm run build`) after the Vite patch when `package.json` has a `build` script, Vite is used and `node_modules/` is available, so `public/build/manifest.json` exists before the first request; the build is skipped when `public/hot` or the manifest already exists, `--no-build` skips it once, `.ws.json` `"build"` disables it (`false`) or replaces the command (string); a failed build warns and never blocks; a new `assets` step is streamed in `--json` mode between `vite` and `caches`.
 - **3.4.0** — Workspace records carry a `urls` array (main URL first, then one `{name, url}` per `.ws.json` subdomain, hosts read from the workspace `.env`); `ws status` and `ws info` list the resolved subdomain URLs; `ws preview [branch] <subdomain>` opens a subdomain and rejects unknown names; `ws preview` refuses unknown workspaces.
 - **3.3.1** — `storage/app` is cloned flat again (3.3.0 nested it under `storage/app/app` and dropped the tracked `.gitignore` files); the clone marker moves to `storage/app/.ws-cloned` so it no longer shows up as untracked; `destroy` kills the workspace's Vite again (the `.worktrees` match had lost its dot); the MySQL existence check no longer treats `_` as a wildcard; the PostgreSQL clone drops ownership and grants so `ON_ERROR_STOP` cannot abort it.
 - **3.3.0** — `.` is slugified like `/` and `_`; `--from origin/<branch>` records its base and sets no upstream; `create pr:N` refreshes a force-pushed PR; `finish --abandon` deletes the branch; `finish` refuses a detached HEAD; `setup` re-runs keep `.env`, `storage/app` and the database name; a separate repository under `.worktrees/` is never removed; MySQL passwords go through `MYSQL_PWD`; database and push failures name their cause; `sed` edits are portable and escape their values; JSON output escapes every control character.
