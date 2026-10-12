@@ -370,10 +370,193 @@ case_setup_assets_failure_does_not_abort() {
     assert_eq 1 "$(printf '%s' "$out" | grep -c "Asset build failed.*boom")" "warning with cause"
 }
 
+# Fake herd on PATH: every call is logged in $HERD_FAKE_STATE/log, "links" lists the linked
+# names, HERD_FAKE_FAIL names a link that fails.
+make_fake_herd() {
+    mkdir -p "$TMP/herd-bin"
+    cat > "$TMP/herd-bin/herd" <<'SH'
+#!/bin/bash
+state="$HERD_FAKE_STATE"
+case "$1" in
+    link)
+        [[ "$2" != "${HERD_FAKE_FAIL:-}" ]] || exit 1
+        echo "link $2 $PWD" >> "$state/log"
+        ;;
+    links)  grep '^link ' "$state/log" 2>/dev/null | cut -d' ' -f2 ;;
+    secure) echo "secure $2" >> "$state/log" ;;
+    unlink) echo "unlink $2" >> "$state/log" ;;
+esac
+SH
+    chmod +x "$TMP/herd-bin/herd"
+    echo "$TMP/herd-bin"
+}
+
+# Call inside a case (it runs in a subshell, so PATH and the exports stay local to it)
+use_fake_herd() {
+    FAKE_HERD_STATE="$TMP/herd-state-$1"
+    mkdir -p "$FAKE_HERD_STATE"
+    export PATH="$(make_fake_herd):$PATH" HERD_FAKE_STATE="$FAKE_HERD_STATE"
+}
+
+fake_herd_log() { grep "^$2 " "$1/log" 2>/dev/null | cut -d' ' -f2 | tr '\n' ' ' | sed 's/ $//'; }
+line_of() { printf '%s\n' "$1" | grep -n -F -- "$2" | head -1 | cut -d: -f1; }
+
+# Git repo on main with a .ws.json, no worktree yet
+make_repo() {
+    local name="$1" config="$2" root
+    root="$TMP/$name"
+    mkdir -p "$root"
+    git -C "$root" init -q
+    git -C "$root" symbolic-ref HEAD refs/heads/main
+    git -C "$root" -c user.name=ws -c user.email=ws@test commit -q --allow-empty -m init
+    printf '%s\n' "$config" > "$root/.ws.json"
+    echo "$root"
+}
+
+case_create_json_emits_usable_after_deps() {
+    local root out sname deps_done usable db_running usable_line
+    root="$(make_repo create-usable '{"profile": "laravel-herd", "subdomains": {"cp": "CP_DOMAIN"}}')"
+    use_fake_herd create-usable
+    sname="create-usable-feat-usable"
+    out="$(cd "$root" && WS_JSON="" bash "$WS_BIN" create feat/usable --json 2>/dev/null)" || return 1
+    deps_done="$(line_of "$out" '{"step":"deps","status":"done"}')"
+    usable="$(line_of "$out" '{"event":"usable",')"
+    db_running="$(line_of "$out" '{"step":"db","status":"running"}')"
+    assert_eq 1 "$(printf '%s\n' "$out" | grep -c '"event":"usable"')" "one usable event"
+    assert_eq "$((deps_done + 1))" "$usable" "usable right after deps done"
+    assert_eq "$((usable + 1))" "$db_running" "db running right after usable"
+    usable_line="$(printf '%s\n' "$out" | sed -n "${usable}p")"
+    assert_eq 1 "$(printf '%s' "$usable_line" | grep -c "\"workspace\":{\"site\":\"$sname\",")" "usable carries the record"
+    assert_eq 1 "$(printf '%s' "$usable_line" | grep -c '"herd":false')" "usable record predates the Herd link"
+    assert_eq 1 "$(printf '%s\n' "$out" | tail -1 | grep -c "^{\"event\":\"ready\",\"workspace\":{\"site\":\"$sname\",.*\"herd\":true")" "ready is last, with the final record"
+    assert_eq "$sname cp.$sname" "$(fake_herd_log "$FAKE_HERD_STATE" link)" "main and subdomain linked"
+    assert_eq 2 "$(grep -c " $root/.worktrees/$sname\$" "$FAKE_HERD_STATE/log")" "herd link run from the workspace"
+}
+
+case_setup_json_has_no_usable() {
+    local root sname="setup-no-usable-feat-setup-no-usable" out
+    root="$(make_project setup-no-usable '{"profile": "laravel-herd"}' "$sname")"
+    use_fake_herd setup-no-usable
+    out="$(cd "$root/.worktrees/$sname" && WS_JSON="" bash "$WS_BIN" setup --json 2>/dev/null)" || return 1
+    assert_eq 1 "$(printf '%s\n' "$out" | grep -c '{"step":"deps","status":"done"}')" "deps done"
+    assert_eq 0 "$(printf '%s\n' "$out" | grep -c '"event":"usable"')" "no usable event"
+    assert_eq 1 "$(printf '%s\n' "$out" | tail -1 | grep -c '^{"event":"ready","site":')" "ready is last"
+}
+
+case_setup_herd_links_and_secures_every_site() {
+    local root wt out
+    root="$(make_root herd-secure-root '{"subdomains": {"cp": "CP_DOMAIN", "api": "API_DOMAIN"}}')"
+    wt="$TMP/herd-secure-wt"
+    mkdir -p "$wt"
+    use_fake_herd secure
+    out="$(cd "$TMP" && _setup_herd app-y --secure "$wt" "$root" 2>&1)" || return 1
+    assert_eq "app-y cp.app-y api.app-y" "$(fake_herd_log "$FAKE_HERD_STATE" link)" "links, main first"
+    assert_eq 3 "$(grep -c " $wt\$" "$FAKE_HERD_STATE/log")" "herd link run from the workspace"
+    assert_eq 3 "$(printf '%s\n' "$out" | grep -c 'Herd link: .*\.test')" "link messages"
+    assert_eq "app-y cp.app-y api.app-y" "$(fake_herd_log "$FAKE_HERD_STATE" secure)" "secure calls, main first"
+    assert_eq 3 "$(printf '%s\n' "$out" | grep -c 'Herd secure: https://')" "secure messages"
+}
+
+case_setup_herd_reports_failed_subdomain_link() {
+    local root wt out
+    root="$(make_root herd-fail-root '{"subdomains": {"cp": "CP_DOMAIN", "api": "API_DOMAIN"}}')"
+    wt="$TMP/herd-fail-wt"
+    mkdir -p "$wt"
+    use_fake_herd fail-sub
+    export HERD_FAKE_FAIL="cp.app-z"
+    out="$(cd "$wt" && _setup_herd app-z --secure "$wt" "$root" 2>&1)" || return 1
+    assert_eq 1 "$(printf '%s\n' "$out" | grep -c 'Herd link cp.app-z failed')" "failure reported"
+    assert_eq 1 "$(printf '%s\n' "$out" | grep -c 'Herd link: app-z.test')" "main link succeeded"
+    assert_eq 1 "$(printf '%s\n' "$out" | grep -c 'Herd link: api.app-z.test')" "other subdomain succeeded"
+    assert_eq "app-z api.app-z" "$(printf '%s\n' "$out" | grep -o 'Herd link: [^ ]*\.test' | sed 's/Herd link: //; s/\.test$//' | tr '\n' ' ' | sed 's/ $//')" "linked sites"
+}
+
+case_setup_herd_failed_main_link_skips_the_rest() {
+    local root wt out
+    root="$(make_root herd-main-fail-root '{"subdomains": {"cp": "CP_DOMAIN"}}')"
+    wt="$TMP/herd-main-fail-wt"
+    mkdir -p "$wt"
+    use_fake_herd fail-main
+    export HERD_FAKE_FAIL="app-w"
+    out="$(cd "$wt" && _setup_herd app-w --secure "$wt" "$root" 2>&1)" || return 1
+    assert_eq 1 "$(printf '%s\n' "$out" | grep -c 'Herd link failed — do it manually')" "main failure reported"
+    assert_eq "" "$(fake_herd_log "$FAKE_HERD_STATE" link)" "no subdomain link"
+    assert_eq "" "$(fake_herd_log "$FAKE_HERD_STATE" secure)" "no secure call"
+}
+
+# A death inside a dependency subshell must still close the stream with a failed event
+case_create_json_fails_when_a_dependency_setup_dies() {
+    local root out rc=0
+    root="$(make_repo create-dies '{"profile": "laravel-herd"}')"
+    use_fake_herd create-dies
+    out="$(cd "$root" && WS_JSON="" bash -c 'source "$1"; _setup_composer() { info "composer starting"; false; }; main create feat/dies --json' _ "$WS_BIN" 2>/dev/null)" || rc=$?
+    assert_eq 1 "$rc" "exit code"
+    assert_eq 1 "$(printf '%s\n' "$out" | tail -1 | grep -c '^{"event":"failed","step":"deps",.*ws destroy create-dies-feat-dies')" "failed event closes the stream"
+    assert_eq 0 "$(printf '%s\n' "$out" | grep -c '"event":"usable"')" "no usable event"
+}
+
+# Dependency project: main checkout with vendor/ and node_modules/, empty workspace next to it
+make_deps_project() {
+    local root wt
+    root="$(make_root "$1-root")"
+    mkdir -p "$root/vendor" "$root/node_modules"
+    wt="$TMP/$1-wt"
+    mkdir -p "$wt"
+    echo '{}' > "$wt/composer.json"
+    echo '{}' > "$wt/package.json"
+    echo "$wt"
+}
+
+case_setup_deps_clones_vendor_and_node_modules_concurrently() {
+    local wt root state
+    wt="$(make_deps_project deps-parallel)"
+    root="$TMP/deps-parallel-root"
+    state="$TMP/deps-parallel-state"
+    mkdir -p "$state"
+    _cow_copy() {
+        touch "$state/running.$2"
+        sleep 0.3
+        local n
+        n="$(ls "$state" | grep -c '^running\.' || true)"
+        rm -f "$state/running.$2"
+        echo "$2 $n" >> "$state/log"
+        mkdir -p "$2"
+    }
+    (cd "$wt" && _setup_deps "$root" > /dev/null 2>&1) || return 1
+    [[ -d "$wt/vendor" && -d "$wt/node_modules" ]] || { echo "    expected vendor/ and node_modules/ in the workspace"; return 1; }
+    assert_eq "node_modules vendor" "$(cut -d' ' -f1 "$state/log" | sort | tr '\n' ' ' | sed 's/ $//')" "both cloned"
+    assert_eq 2 "$(awk '$2 > max { max = $2 } END { print max + 0 }' "$state/log")" "both running at once"
+}
+
+case_setup_deps_reports_both_outcomes() {
+    local wt root out
+    wt="$(make_deps_project deps-outcomes)"
+    root="$TMP/deps-outcomes-root"
+    mkdir -p "$TMP/deps-outcomes-bin"
+    printf '#!/bin/sh\nexit 1\n' > "$TMP/deps-outcomes-bin/composer"
+    chmod +x "$TMP/deps-outcomes-bin/composer"
+    export PATH="$TMP/deps-outcomes-bin:$PATH"
+    _cow_copy() { [[ "$2" != "vendor" ]] && mkdir -p "$2"; }
+    out="$(cd "$wt" && _setup_deps "$root" 2>&1)" || return 1
+    assert_eq 1 "$(printf '%s\n' "$out" | grep -c 'vendor/ clone failed')" "composer clone failure reported"
+    assert_eq 1 "$(printf '%s\n' "$out" | grep -c 'Composer install failed')" "composer install failure reported"
+    assert_eq 1 "$(printf '%s\n' "$out" | grep -c 'node_modules/ cloned')" "npm success reported"
+}
+
+case_setup_deps_surfaces_death_after_both_finished() {
+    local wt root out rc=0
+    wt="$(make_deps_project deps-death)"
+    root="$TMP/deps-death-root"
+    _setup_composer() { info "composer starting"; false; }
+    out="$(cd "$wt" && _setup_deps "$root" 2>&1)" || rc=$?
+    assert_eq 1 "$rc" "exit code of the dead subshell"
+    assert_eq 1 "$(printf '%s\n' "$out" | grep -c 'node_modules/ cloned')" "npm outcome still reported"
+}
+
 run_case() {
     local name="$1" rc
     set +e
-    ( "$name" )
+    ( set -e; "$name" )
     rc=$?
     set -e
     if [[ $rc -eq 0 ]]; then
@@ -413,6 +596,15 @@ run_case case_setup_assets_skips_with_no_build
 run_case case_setup_assets_skips_when_disabled
 run_case case_setup_assets_runs_override_command
 run_case case_setup_assets_failure_does_not_abort
+run_case case_create_json_emits_usable_after_deps
+run_case case_setup_json_has_no_usable
+run_case case_create_json_fails_when_a_dependency_setup_dies
+run_case case_setup_herd_links_and_secures_every_site
+run_case case_setup_herd_reports_failed_subdomain_link
+run_case case_setup_herd_failed_main_link_skips_the_rest
+run_case case_setup_deps_clones_vendor_and_node_modules_concurrently
+run_case case_setup_deps_reports_both_outcomes
+run_case case_setup_deps_surfaces_death_after_both_finished
 
 echo "$PASSED passed, $FAILED failed"
 [[ $FAILED -eq 0 ]]

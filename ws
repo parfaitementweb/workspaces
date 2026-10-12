@@ -6,7 +6,7 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="3.5.0"
+VERSION="3.6.0"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
 MAX_LABEL_LEN=60
@@ -1181,9 +1181,14 @@ _provision() {
     emit_step deps running
     _setup_agent_files "$root"
     _setup_local_files "$root"
-    _setup_composer "$root"
-    _setup_npm "$root"
+    _setup_deps "$root"
     emit_step deps done
+    # The worktree and its dependencies are enough for an agent to start: let
+    # consumers hand it over while the rest of the provisioning goes on
+    if [[ -n "$WS_JSON" && -n "$WS_CREATED_SITE" ]]; then
+        _workspace_record "$root" "$sname"
+        emit_event usable "\"workspace\":$(_workspace_json)"
+    fi
     if _profile_is_plain; then
         info "Plain profile: no database, Herd link or Vite patch"
         emit_step hooks running "post-create"
@@ -1432,6 +1437,20 @@ _relative_path() {
         python3 -c 'import os, sys; print(os.path.relpath(os.path.realpath(sys.argv[1]), os.path.realpath(sys.argv[2])))' "$target" "$from_dir" 2>/dev/null && return 0
     fi
     echo "$target"
+}
+
+# Composer and npm are independent: clone or install both at once. Each one reports
+# its own outcome; an unexpected death in either surfaces only once both are finished.
+_setup_deps() {
+    local root="$1" composer_pid npm_pid composer_rc=0 npm_rc=0
+    _setup_composer "$root" &
+    composer_pid=$!
+    _setup_npm "$root" &
+    npm_pid=$!
+    wait "$composer_pid" || composer_rc=$?
+    wait "$npm_pid" || npm_rc=$?
+    (( composer_rc == 0 )) || return "$composer_rc"
+    return "$npm_rc"
 }
 
 # Clone <dir> from root via CoW when missing locally, then sync if lockfiles differ
@@ -2681,7 +2700,8 @@ cmd_help() {
     echo ""
     echo -e "${BOLD}Machine output:${NC}"
     echo -e "  Add ${CYAN}--json${NC} to any command: status/info print records (with a \"urls\" array: main URL"
-    echo -e "  first, then one {name,url} per .ws.json subdomain), create streams NDJSON steps,"
+    echo -e "  first, then one {name,url} per .ws.json subdomain), create streams NDJSON steps"
+    echo -e "  (a \"usable\" event once deps are in place, \"ready\" or \"failed\" last),"
     echo -e "  finish/destroy print one event and refuse to prompt. Errors are {\"error\":...} on stderr."
     echo -e "  WS_JSON=1 in the environment is equivalent. Exit codes: 0 success, 1 user error, 2 environment error."
     echo ""
@@ -2701,7 +2721,8 @@ cmd_help() {
     echo ""
     echo -e "${BOLD}Speed:${NC}"
     echo -e "  vendor/, node_modules/ and storage/app are cloned from the main project with"
-    echo -e "  APFS copy-on-write; the database is cloned (PG TEMPLATE / mysqldump)."
+    echo -e "  APFS copy-on-write (vendor/ and node_modules/ at once); the database is cloned"
+    echo -e "  (PG TEMPLATE / mysqldump)."
     echo ""
     echo -e "${BOLD}Naming:${NC}"
     echo -e "  Herd sites use the format ${CYAN}project-branch.test${NC}"

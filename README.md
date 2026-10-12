@@ -97,7 +97,7 @@ Everything is handled automatically:
 - Updates `APP_URL`, `SESSION_DOMAIN`, `SANCTUM_STATEFUL_DOMAINS`, `SESSION_SECURE_COOKIE`
 - Assigns a unique `VITE_PORT` (deterministic per branch, avoids `npm run dev` collisions)
 - Namespaces shared services: `CACHE_PREFIX` / `REDIS_PREFIX` (when Redis or Memcached is used), `HORIZON_PREFIX`, `SCOUT_PREFIX`
-- Clones `vendor/` and `node_modules/` from the main project with copy-on-write, then syncs only if the lockfile differs
+- Clones `vendor/` and `node_modules/` from the main project with copy-on-write, both at once, then syncs only if the lockfile differs
 - Clones the database (`myproject_feature_auth`) from the main one — PostgreSQL `TEMPLATE`, `mysqldump`, or SQLite file copy — then runs migrations. `--fresh` creates an empty DB and runs migrations + seeders instead. A database that already exists under that name is kept as is (migrations only). SQLite keeps `DB_DATABASE` untouched: the file (default `database/database.sqlite`, relative to the worktree) is copied, an absolute path is left alone
 - Isolates the test database (`test_myproject_feature_auth`): copies `.env.testing`, creates an empty DB, and points `phpunit.xml` at it so suites can run in parallel with the main repo without deadlocking
 - Clones `storage/app` (uploads) and runs `storage:link`
@@ -109,7 +109,7 @@ Everything is handled automatically:
 - Clears Laravel caches
 - Runs your `pre-create` / `post-create` hooks
 
-Typical timing on a large Laravel app (380 MB vendor, 1 GB PostgreSQL DB): **~35 s**, most of it the DB clone.
+Typical timing on a large Laravel app (380 MB vendor, 1 GB PostgreSQL DB): **~35 s**, most of it the DB clone. In `--json` mode the `usable` event fires as soon as the worktree and its dependencies exist (a few seconds in), so an agent can be started before the database, Herd site and assets are ready.
 
 **PR checkout** (`ws create pr:N`) fetches `pull/N/head` into a local branch `pr-N` via `gh` and creates a worktree on it — ideal for reviewing a PR in a full Laravel environment (isolated DB, Herd link, dependencies).
 
@@ -243,6 +243,10 @@ Streams NDJSON, one line per step, flushed as it happens:
 {"step":"hooks","status":"done","message":"pre-create"}
 {"step":"env","status":"running"}
 ...
+{"step":"deps","status":"done"}
+{"event":"usable","workspace":{ ...record... }}
+{"step":"db","status":"running"}
+...
 {"event":"ready","workspace":{ ...record... }}
 ```
 
@@ -251,6 +255,7 @@ Every stdout line is one JSON object of one of these shapes:
 | Line | Meaning |
 |---|---|
 | `{"step": S, "status": "running"\|"done", "message"?: M}` | Progress. `hooks` is emitted twice, with `message` `pre-create` then `post-create`: key on step + message. A step never carries a `failed` status |
+| `{"event": "usable", "workspace": <record>}` | Emitted once, right after `deps` is `done`: the worktree, its `.env` and its dependencies are in place, enough for an agent to start working while the database, Herd site and assets are still being provisioned. `workspace` is the record as it stands at that moment (`herd` is `false`, `db` names a database that may not exist yet); the `ready` record supersedes it. A consumer that ignores the event sees the same stream as before |
 | `{"event": "ready", "workspace": <record>}` | Last line on success |
 | `{"event": "failed", "step": S, "message": M}` | Last line on a hard failure, followed by a non-zero exit. Once the worktree exists, `message` names the `ws destroy` command that cleans up |
 
@@ -258,7 +263,7 @@ Step order, `laravel-herd` profile: `worktree`, `hooks` (pre-create), `env`, `de
 
 ### `ws setup --json`
 
-Same stream without the `worktree` step. The final line is `{"event":"ready","site":...,"branch":...,"path":...}` (no record: the checkout is not necessarily under `.worktrees/`), and a hard failure is the same `failed` event as above.
+Same stream without the `worktree` step and without the `usable` event. The final line is `{"event":"ready","site":...,"branch":...,"path":...}` (no record: the checkout is not necessarily under `.worktrees/`), and a hard failure is the same `failed` event as above.
 
 ### `ws finish <branch> --pr|--merge|--abandon --json`
 
@@ -478,6 +483,7 @@ Only Redis and Memcached are namespaced automatically. If you use another shared
 
 ## Changelog
 
+- **3.6.0** — `ws create --json` streams a `usable` event (same `workspace` record as `ready`) right after the `deps` step, so a consumer can hand the workspace to an agent while the database, Herd site and assets are still being provisioned; `ws setup` never emits it. `vendor/` and `node_modules/` are cloned concurrently.
 - **3.5.0** — `ws create` and `ws setup` build the front assets (`npm run build`) after the Vite patch when `package.json` has a `build` script, Vite is used and `node_modules/` is available, so `public/build/manifest.json` exists before the first request; the build is skipped when `public/hot` or the manifest already exists, `--no-build` skips it once, `.ws.json` `"build"` disables it (`false`) or replaces the command (string); a failed build warns and never blocks; a new `assets` step is streamed in `--json` mode between `vite` and `caches`.
 - **3.4.0** — Workspace records carry a `urls` array (main URL first, then one `{name, url}` per `.ws.json` subdomain, hosts read from the workspace `.env`); `ws status` and `ws info` list the resolved subdomain URLs; `ws preview [branch] <subdomain>` opens a subdomain and rejects unknown names; `ws preview` refuses unknown workspaces.
 - **3.3.1** — `storage/app` is cloned flat again (3.3.0 nested it under `storage/app/app` and dropped the tracked `.gitignore` files); the clone marker moves to `storage/app/.ws-cloned` so it no longer shows up as untracked; `destroy` kills the workspace's Vite again (the `.worktrees` match had lost its dot); the MySQL existence check no longer treats `_` as a wildcard; the PostgreSQL clone drops ownership and grants so `ON_ERROR_STOP` cannot abort it.
