@@ -6,10 +6,11 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="3.6.0"
+VERSION="3.6.1"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
-MAX_LABEL_LEN=60
+# herd secure needs <host>.test within the 64-char TLS common name
+MAX_HOST_LEN=59
 WS_JSON="${WS_JSON:-}"
 WS_OUT=1
 
@@ -123,7 +124,7 @@ _short_hash() {
 
 # Keep a label within DNS / database name limits, deterministically
 _truncate_label() {
-    local name="$1" max="${2:-$MAX_LABEL_LEN}"
+    local name="$1" max="${2:-$MAX_HOST_LEN}"
     if (( ${#name} <= max )); then
         echo "$name"
     else
@@ -131,12 +132,23 @@ _truncate_label() {
     fi
 }
 
+# Longest site name whose "<prefix>.<site>" hosts all fit MAX_HOST_LEN, for the .ws.json subdomains of <root>
+site_max_len() {
+    local root="${1:-}" max="$MAX_HOST_LEN" prefix _env_var
+    [[ -n "$root" ]] || { echo "$max"; return 0; }
+    while IFS=: read -r prefix _env_var; do
+        [[ -z "$prefix" ]] && continue
+        (( MAX_HOST_LEN - ${#prefix} - 1 < max )) && max=$((MAX_HOST_LEN - ${#prefix} - 1))
+    done < <(_ws_config_subdomains "$root")
+    echo "$max"
+}
+
 # Full site name: project-branch
 site_name() {
-    local proj slug
-    proj="$(project_name)"
+    local root slug
+    root="$(find_project_root)"
     slug="$(slugify "$1")"
-    _truncate_label "${proj}-${slug}"
+    _truncate_label "$(basename "$root")-${slug}" "$(site_max_len "$root")"
 }
 
 # Accept either a branch name or an existing site name (as shown by `ws status`)
@@ -1111,13 +1123,14 @@ cmd_setup() {
     branch_name="$(git -C "$wt_path" branch --show-current 2>/dev/null)"
     [[ -z "$branch_name" ]] && branch_name="$(git -C "$wt_path" rev-parse --short HEAD 2>/dev/null)"
 
-    local sname
+    local sname max_len
+    max_len="$(site_max_len "$source_root")"
     if [[ -n "$name_override" ]]; then
-        sname="$(_truncate_label "$(slugify "$name_override")")"
+        sname="$(_truncate_label "$(slugify "$name_override")" "$max_len")"
     elif [[ -n "$source_root" ]]; then
-        sname="$(_truncate_label "$(basename "$source_root")-$(slugify "$branch_name")")"
+        sname="$(_truncate_label "$(basename "$source_root")-$(slugify "$branch_name")" "$max_len")"
     else
-        sname="$(_truncate_label "$(slugify "$(basename "$wt_path")")")"
+        sname="$(_truncate_label "$(slugify "$(basename "$wt_path")")" "$max_len")"
     fi
 
     resolve_profile "${source_root:-$wt_path}" "$profile_flag" "$branch_name" >/dev/null

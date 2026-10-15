@@ -441,7 +441,7 @@ my-project/
 | `SCOUT_PREFIX` | `project_branch_` (if Scout installed) |
 | `<domain>` / `<subdomains>` from `.ws.json` | `project-branch.test` / `prefix.project-branch.test` |
 
-Names longer than 60 chars are truncated with a short hash to stay within hostname / database-name limits.
+Site names are capped so every Herd host fits a TLS certificate (`<site>.test` and each `<prefix>.<site>.test` at most 64 chars): 59 chars, minus the longest `.ws.json` subdomain prefix and its dot (`cp` gives 56). Longer names are truncated with a short hash. Database names are capped at 63.
 
 ## Troubleshooting
 

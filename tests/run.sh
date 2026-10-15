@@ -484,6 +484,43 @@ case_setup_herd_failed_main_link_skips_the_rest() {
     assert_eq "" "$(fake_herd_log "$FAKE_HERD_STATE" secure)" "no secure call"
 }
 
+case_site_max_len_leaves_room_for_subdomains() {
+    local plain cp both
+    plain="$(make_root max-plain '{}')"
+    cp="$(make_root max-cp '{"subdomains": {"cp": "CP_DOMAIN"}}')"
+    both="$(make_root max-both '{"subdomains": {"cp": "CP_DOMAIN", "app": "APP_DOMAIN"}}')"
+    assert_eq 59 "$(site_max_len "")" "no project root"
+    assert_eq 59 "$(site_max_len "$plain")" "no subdomains"
+    assert_eq 56 "$(site_max_len "$cp")" "cp"
+    assert_eq 55 "$(site_max_len "$both")" "longest prefix wins"
+}
+
+case_site_name_fits_the_certificate_limit() {
+    local root fits long name
+    root="$(make_repo name-cap '{}')"
+    fits="$(printf 'b%.0s' {1..50})"
+    long="${fits}c"
+    assert_eq "name-cap-$fits" "$(cd "$root" && site_name "$fits")" "59 chars kept as is"
+    name="$(cd "$root" && site_name "$long")"
+    assert_eq 59 "${#name}" "60 chars truncated to 59"
+    assert_eq "name-cap-${fits:0:43}-$(_short_hash "name-cap-$long")" "$name" "prefix and 6-char hash"
+}
+
+case_create_long_branch_every_host_fits_the_certificate_limit() {
+    local root sname host out
+    root="$(make_repo long-hosts '{"profile": "laravel-herd", "subdomains": {"cp": "CP_DOMAIN", "app": "APP_DOMAIN"}}')"
+    use_fake_herd long-hosts
+    (cd "$root" && WS_JSON="" bash "$WS_BIN" create feat/accueil-hero-fixe-et-section-questions-vb-t27 --json >/dev/null 2>&1) || return 1
+    sname="$(ls "$root/.worktrees")"
+    assert_eq 55 "${#sname}" "site name length"
+    for host in $(fake_herd_log "$FAKE_HERD_STATE" link); do
+        (( ${#host} <= 59 )) || { echo "    $host: ${#host} chars"; return 1; }
+    done
+    assert_eq "$sname cp.$sname app.$sname" "$(fake_herd_log "$FAKE_HERD_STATE" link)" "links match the worktree folder"
+    out="$(status_json "$root")"
+    assert_eq 1 "$(printf '%s' "$out" | grep -c "\"site\":\"$sname\",.*\"herd\":true")" "status sees the Herd link"
+}
+
 # A death inside a dependency subshell must still close the stream with a failed event
 case_create_json_fails_when_a_dependency_setup_dies() {
     local root out rc=0
@@ -596,6 +633,9 @@ run_case case_setup_assets_skips_with_no_build
 run_case case_setup_assets_skips_when_disabled
 run_case case_setup_assets_runs_override_command
 run_case case_setup_assets_failure_does_not_abort
+run_case case_site_max_len_leaves_room_for_subdomains
+run_case case_site_name_fits_the_certificate_limit
+run_case case_create_long_branch_every_host_fits_the_certificate_limit
 run_case case_create_json_emits_usable_after_deps
 run_case case_setup_json_has_no_usable
 run_case case_create_json_fails_when_a_dependency_setup_dies
