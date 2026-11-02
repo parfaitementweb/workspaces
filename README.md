@@ -28,13 +28,13 @@ Cheat sheet:
 
 | Command | What it does |
 |---|---|
-| `ws create <branch\|pr:N> [--from <branch>] [--secure] [--fresh] [--no-build] [--plain] [--open] [--agent <cmd> -- args]` | Create a workspace (base branch, HTTPS, empty DB, no asset build, no Laravel steps, open agent, other agent) |
-| `ws setup [--from <repo>] [--name <site>] [--secure] [--fresh] [--no-build] [--plain] [--standalone]` | Provision the current checkout (worktree, Polyscope clone...) |
+| `ws create <branch\|pr:N> [--from <branch>] [--secure] [--fresh] [--no-build] [--profile <laravel-herd\|plain\|node>] [--plain] [--open] [--agent <cmd> -- args]` | Create a workspace (base branch, HTTPS, empty DB, no asset build, profile, open agent, other agent). `--plain` is `--profile plain` |
+| `ws setup [--from <repo>] [--name <site>] [--secure] [--fresh] [--no-build] [--profile <laravel-herd\|plain\|node>] [--plain] [--standalone]` | Provision the current checkout (worktree, Polyscope clone...) |
 | `ws run [branch] [--agent <cmd>] [-- args]` | Launch the agent in the workspace |
 | `ws open [branch] [--agent <cmd>] [-- args]` | Same, in a new terminal tab/window |
 | `ws status` | Overview of all workspaces |
-| `ws info [branch]` | One workspace: branch, base, commits ahead, URL, DB, test DB, Herd |
-| `ws preview [branch] [subdomain]` | Open the site, or one of its `.ws.json` subdomains, in the browser |
+| `ws info [branch]` | One workspace: branch, base, commits ahead, URL, port, DB, test DB, Herd |
+| `ws preview [branch] [subdomain]` | Open the site, one of its `.ws.json` subdomains, or the `node` dev-server URL, in the browser |
 | `ws finish\|merge [branch] [--into <branch>] [--pr\|--merge\|--abandon] [--message\|-m <msg>] [--title <t>] [--cleanup]` | PR / merge / abandon against the base branch, guided or non-interactive |
 | `ws destroy <branch> [--keep-db] [--yes\|-y]` | Delete everything |
 | `ws hook create\|remove` | Adapter for Claude Code `WorktreeCreate` / `WorktreeRemove` hooks |
@@ -151,13 +151,14 @@ my-project — Workspaces
   └─ → https://admin.my-project-feature-auth.test
   fix/header  +1  ✓ DB  – Herd  → http://my-project-fix-header.test
   docs/readme  +0  plain → /Users/me/Sites/my-project/.worktrees/my-project-docs-readme
+  feat/dashboard  +2  node → http://localhost:3001
   my-project-old-thing  stale (no git worktree, run: ws destroy my-project-old-thing)
 ```
 
-The yellow `●` indicates uncommitted changes. Subdomains from `.ws.json` are listed under their site, `plain` workspaces show their path instead of a URL, and a `stale` line is a directory left in `.worktrees/` after its worktree was pruned.
+The yellow `●` indicates uncommitted changes. Subdomains from `.ws.json` are listed under their site, `plain` workspaces show their path instead of a URL, `node` workspaces show their dev-server URL, and a `stale` line is a directory left in `.worktrees/` after its worktree was pruned.
 
 ```bash
-ws info feature/auth       # one workspace: branch, base, commits ahead, URL, DB, test DB, Herd
+ws info feature/auth       # one workspace: branch, base, commits ahead, URL, port (node), DB, test DB, Herd
 ws info                    # from a worktree
 ```
 
@@ -170,7 +171,7 @@ ws preview feature/auth admin   # the "admin" subdomain declared in .ws.json
 ws preview admin                # same, from a worktree
 ```
 
-Automatically detects whether the site is HTTP or HTTPS. The subdomain argument is a key of the `subdomains` map in `.ws.json`; the host opened is the one written in the workspace `.env`. An unknown key fails and lists the available ones. From a worktree, a single argument that matches a declared subdomain (and no existing workspace) is taken as the subdomain.
+Automatically detects whether the site is HTTP or HTTPS. The subdomain argument is a key of the `subdomains` map in `.ws.json`; the host opened is the one written in the workspace `.env`. An unknown key fails and lists the available ones. From a worktree, a single argument that matches a declared subdomain (and no existing workspace) is taken as the subdomain. A `node` workspace opens `http://localhost:<port>` and has no subdomains; a `plain` workspace has nothing to open.
 
 ### Finish work
 
@@ -228,9 +229,26 @@ Exit codes: `0` success, or a confirmation declined at a prompt (nothing was don
 }
 ```
 
-`site`, `branch`, `path`, `base`, `dirty`, `ahead` (commits ahead of `base`) and `profile` are always present. `url`, `urls`, `db`, `test_db` and `herd` are omitted, never `null`, when they do not apply: no `.env`, no test database, Herd not installed. `"stale": true` flags a directory left in `.worktrees/` without a git worktree behind it (`branch` is then `?`); `ws destroy` removes it.
+`site`, `branch`, `path`, `base`, `dirty`, `ahead` (commits ahead of `base`) and `profile` are always present. `url`, `urls`, `port`, `db`, `test_db` and `herd` are omitted, never `null`, when they do not apply: no `.env`, no test database, Herd not installed, not a `node` workspace. `"stale": true` flags a directory left in `.worktrees/` without a git worktree behind it (`branch` is then `?`); `ws destroy` removes it.
 
 `urls` is the ordered list of preview URLs, present whenever `url` is. The first entry is the main URL (same value as `url`, no `name`); it is followed by one entry per key of the `subdomains` map in `.ws.json`, in file order, with `name` set to the key. Each subdomain URL is the host stored in the workspace `.env` under the mapped variable, with the protocol of the main URL; when the variable is missing (workspace created before the subdomain was declared) it falls back to `<name>.<site>.test`. The same array appears in the `ready` event of `ws create --json` and `ws setup --json`.
+
+A `node` workspace carries `port` (a JSON number, the dev-server port recorded in `git config branch.<name>.ws-port`, else `PORT` in the workspace `.env`), `url` set to `http://localhost:<port>` and a single-entry `urls`; `.ws.json` subdomains are ignored, `db`, `test_db` and `herd` are absent. Without a known port the three fields are omitted:
+
+```json
+{
+  "site": "my-project-feat-dashboard",
+  "branch": "feat/dashboard",
+  "path": "/Users/me/Sites/my-project/.worktrees/my-project-feat-dashboard",
+  "base": "main",
+  "dirty": false,
+  "ahead": 2,
+  "profile": "node",
+  "url": "http://localhost:3001",
+  "urls": [{ "url": "http://localhost:3001" }],
+  "port": 3001
+}
+```
 
 ### `ws create <branch> --json`
 
@@ -259,7 +277,7 @@ Every stdout line is one JSON object of one of these shapes:
 | `{"event": "ready", "workspace": <record>}` | Last line on success |
 | `{"event": "failed", "step": S, "message": M}` | Last line on a hard failure, followed by a non-zero exit. Once the worktree exists, `message` names the `ws destroy` command that cleans up |
 
-Step order, `laravel-herd` profile: `worktree`, `hooks` (pre-create), `env`, `deps`, `db`, `test_db`, `storage`, `herd`, `vite`, `assets`, `caches`, `hooks` (post-create). `plain` profile: `worktree`, `hooks` (pre-create), `env`, `deps`, `hooks` (post-create). Provisioning steps that degrade gracefully (missing tool, DB clone fallback) stay `done` and explain themselves on stderr. Errors are never on stdout: a stream that ends without `ready` nor `failed` (tool killed) must be read as a failure from the exit code.
+Step order, `laravel-herd` profile: `worktree`, `hooks` (pre-create), `env`, `deps`, `db`, `test_db`, `storage`, `herd`, `vite`, `assets`, `caches`, `hooks` (post-create). `plain` and `node` profiles: `worktree`, `hooks` (pre-create), `env`, `deps`, `hooks` (post-create); for `node` the port is allocated inside `env`, so the `usable` record already carries `url` and `port`. Provisioning steps that degrade gracefully (missing tool, DB clone fallback) stay `done` and explain themselves on stderr. Errors are never on stdout: a stream that ends without `ready` nor `failed` (tool killed) must be read as a failure from the exit code.
 
 ### `ws setup --json`
 
@@ -316,7 +334,7 @@ Polyscope clones the whole project folder with copy-on-write and runs a setup sc
 
 Use any agent CLI with `ws run --agent codex`, `WS_AGENT=cursor-agent`, or `"agent": "..."` in `.ws.json`. Claude Code is the default.
 
-Both `ws create` and `ws setup` copy local Claude files and `.codex/config.toml` from the main checkout, including Codex MCP server declarations that are not tracked by Git. Missing source files are skipped; existing workspace files are never overwritten. This applies to both the Laravel and plain profiles.
+Both `ws create` and `ws setup` copy local Claude files and `.codex/config.toml` from the main checkout, including Codex MCP server declarations that are not tracked by Git. Missing source files are skipped; existing workspace files are never overwritten. This applies to every profile.
 
 ## Hooks
 
@@ -339,8 +357,9 @@ The following variables are exported to hooks:
 | `WS_SITE` | Slug used for the Herd site / worktree dir | all |
 | `WS_DIR` | Absolute path to the worktree (already removed when `post-finish` ran a cleanup) | all |
 | `WS_ROOT` | Absolute path to the main repo | all |
-| `WS_PROFILE` | `laravel-herd` or `plain` | all |
-| `WS_URL` | Full URL (`http(s)://…test`), empty for `plain` | `pre-create`, `post-create` |
+| `WS_PROFILE` | `laravel-herd`, `plain` or `node` | all |
+| `WS_URL` | Full URL (`http(s)://…test`, `http://localhost:<port>` for `node` once the port is allocated), empty for `plain` | `pre-create`, `post-create` |
+| `WS_PORT` | Dev-server port of a `node` workspace (allocated during the `env` step, so empty in `pre-create`), empty otherwise | `post-create` |
 | `WS_DB` | Workspace database name (if Laravel + DB detected) | `post-create` |
 | `WS_TEST_DB` | Workspace test database name (if a test DB was detected) | `post-create` |
 | `WS_BASE` | Base branch targeted by `ws finish` | `post-finish` |
@@ -366,8 +385,11 @@ Don't forget `chmod +x .ws/hooks/post-create`. Hooks are optional — if a file 
 |---|---|
 | `laravel-herd` | Everything described above: `.env` patched, dependencies cloned, database cloned, test database isolated, Herd link, Vite port, assets built, caches cleared |
 | `plain` | Worktree, `.env` copied as is (only when the workspace has none and the main checkout has one), `.claude/settings.local.json` / `CLAUDE.local.md` / `.codex/config.toml` copied when present in the main checkout and absent from the workspace, `"files"` symlinked, `vendor/` and `node_modules/` cloned copy-on-write (or installed) when `composer.json` / `package.json` exist, `.ws/hooks/` hooks. No database, no test database, no storage clone, no Herd, no Vite patch, no asset build, no cache clear |
+| `node` | Everything `plain` does, plus one dev-server port per workspace: `PORT=<port>` is set in the workspace `.env` (line replaced, appended, or `.env` created with that single line) and recorded in `git config branch.<name>.ws-port`. The workspace is exposed as `http://localhost:<port>` (`ws status`, `ws info`, `ws preview`, JSON records, `WS_URL` / `WS_PORT` in hooks). `ws` never starts the dev server |
 
-The profile is resolved once per command: `--plain` flag (`ws create`, `ws setup`), then the profile the workspace was provisioned with (recorded in `git config branch.<name>.ws-profile`, next to its base branch), then `"profile"` in `.ws.json`, then detection (`artisan` present → `laravel-herd`, otherwise `plain`). An unknown value is reported and replaced by detection. Hooks receive it as `WS_PROFILE`. `ws status`, `ws finish` and `ws destroy` read the recorded profile, so a workspace created with `--plain` stays plain for its whole life: it is torn down without touching any database or Herd site, and its JSON record carries `"profile": "plain"` and none of the `url`, `db`, `test_db`, `herd` fields. `--secure` and `--fresh` are ignored, with a warning, for plain workspaces, and `ws preview` refuses them.
+The profile is resolved once per command: `--profile <laravel-herd|plain|node>` flag (`ws create`, `ws setup`; `--plain` is `--profile plain`, an unknown value exits 1), then the profile the workspace was provisioned with (recorded in `git config branch.<name>.ws-profile`, next to its base branch), then `"profile"` in `.ws.json`, then detection (`artisan` present → `laravel-herd`, otherwise `plain`). `node` is never detected (a `package.json` does not turn a plain project into node): opt in with the flag or `.ws.json`. An unknown value in `.ws.json` or git config is reported and replaced by detection. Hooks receive the profile as `WS_PROFILE`. `ws status`, `ws finish` and `ws destroy` read the recorded profile, so a workspace created with `--plain` stays plain for its whole life: it is torn down without touching any database or Herd site, and its JSON record carries `"profile": "plain"` and none of the `url`, `db`, `test_db`, `herd` fields. The same holds for `node`, whose record adds `url`, `urls` and `port`. `--secure`, `--fresh` and `--no-build` are ignored, with a warning, for plain and node workspaces; `ws preview` refuses plain ones and opens the localhost URL of node ones.
+
+Port of a `node` workspace: the base port of the project is `PORT` in the main checkout `.env`, else `"port"` in `.ws.json`, else 3000; it belongs to the main checkout and is never given to a workspace. During the `env` step, the workspace gets the lowest port above the base port that is neither recorded for another branch (`branch.*.ws-port`) nor currently listening (`lsof`, else `nc`, else the check is skipped). A workspace that already has a recorded port keeps it (`ws setup` on an existing worktree). `.env` not being gitignored in the worktree is reported, not fatal. Deleting the branch drops its `branch.<name>.*` config, port included.
 
 ## Configuration (`.ws.json`)
 
@@ -383,19 +405,21 @@ Optional file at the repo root:
     "api": "API_DOMAIN"
   },
   "files": ["db-prod.toml", ".mcp.local.json"],
-  "build": false
+  "build": false,
+  "port": 3000
 }
 ```
 
 | Key | Purpose |
 |---|---|
-| `profile` | `laravel-herd` \| `plain` (default: auto-detected, see Profiles) |
+| `profile` | `laravel-herd` \| `plain` \| `node` (default: auto-detected between the first two, see Profiles) |
 | `agent` | Agent CLI launched by `ws run` / `ws open` (default `claude`). Env override: `WS_AGENT` |
 | `terminal` | `tmux` \| `iterm` \| `terminal` \| `ghostty` \| `none` (default: auto). Env override: `WS_TERMINAL` |
 | `domain` | Env var holding the project's main host, patched to `<project>-<branch>.test` |
 | `subdomains` | Map of `prefix → env_var`. Each entry adds a `herd link` (`admin.<project>-<branch>.test`), patches the env var, is added to `SANCTUM_STATEFUL_DOMAINS`, and switches `SESSION_DOMAIN` to `.<project>-<branch>.test` so cookies span all hosts |
 | `files` | Gitignored files (relative to the repo root) symlinked from the main checkout into each workspace, so tooling that reads them by relative path (MCP servers, CLIs) keeps working. Existing files are left untouched; missing sources and paths that are not gitignored are skipped with a warning. Files `ws` provisions itself (`.env`, `.env.testing`, `phpunit.xml`, SQLite files, `storage`, `vendor`, `node_modules`) are refused |
 | `build` | `false` disables the front asset build for the project; a string (`"pnpm build"`, `"npm run build -- --mode staging"`) replaces the default `npm run build` and runs as is, without detection. Default: `npm run build` when `package.json` has a `build` script, Vite is used and `node_modules/` is available |
+| `port` | Base dev-server port of a `node` project, as a number or a numeric string; `node` workspaces get the next free ports above it. Used only when the main checkout `.env` has no `PORT` (default 3000) |
 
 With `--secure`, each subdomain is also passed through `herd secure`. `ws destroy` cleans up every subdomain link as long as `.ws.json` is still present at the repo root.
 
@@ -483,6 +507,7 @@ Only Redis and Memcached are namespaced automatically. If you use another shared
 
 ## Changelog
 
+- **3.7.0** — `node` profile: `plain` plus one dev-server port per workspace, allocated during the `env` step above the project base port (`PORT` in the main `.env`, else `.ws.json` `"port"`, else 3000), skipping ports recorded for other branches or already listening; written as `PORT=` in the workspace `.env`, recorded in `branch.<name>.ws-port`, exposed as `http://localhost:<port>` in `ws status` / `ws info` / `ws preview`, in JSON records (`url`, `urls`, new `port` field) and in hooks (`WS_URL`, new `WS_PORT`). `--profile <laravel-herd|plain|node>` on `ws create` and `ws setup` (`--plain` kept as an alias); `node` is opt-in, never detected.
 - **3.6.0** — `ws create --json` streams a `usable` event (same `workspace` record as `ready`) right after the `deps` step, so a consumer can hand the workspace to an agent while the database, Herd site and assets are still being provisioned; `ws setup` never emits it. `vendor/` and `node_modules/` are cloned concurrently.
 - **3.5.0** — `ws create` and `ws setup` build the front assets (`npm run build`) after the Vite patch when `package.json` has a `build` script, Vite is used and `node_modules/` is available, so `public/build/manifest.json` exists before the first request; the build is skipped when `public/hot` or the manifest already exists, `--no-build` skips it once, `.ws.json` `"build"` disables it (`false`) or replaces the command (string); a failed build warns and never blocks; a new `assets` step is streamed in `--json` mode between `vite` and `caches`.
 - **3.4.0** — Workspace records carry a `urls` array (main URL first, then one `{name, url}` per `.ws.json` subdomain, hosts read from the workspace `.env`); `ws status` and `ws info` list the resolved subdomain URLs; `ws preview [branch] <subdomain>` opens a subdomain and rejects unknown names; `ws preview` refuses unknown workspaces.

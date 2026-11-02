@@ -6,7 +6,7 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="3.6.1"
+VERSION="3.7.0"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
 # herd secure needs <host>.test within the 64-char TLS common name
@@ -323,6 +323,29 @@ PY
     fi
 }
 
+# Read the "port" of .ws.json, accepting a JSON number or a numeric string. Empty if absent.
+_ws_config_port() {
+    local root="$1" port=""
+    local config="$root/.ws.json"
+    [[ -n "$root" && -f "$config" ]] || return 0
+    if command -v jq &>/dev/null; then
+        port="$(jq -r '.port // empty | select(type == "number" or type == "string") | tostring' "$config" 2>/dev/null || true)"
+    elif command -v python3 &>/dev/null; then
+        port="$(python3 - "$config" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get("port", "")
+    if not isinstance(v, bool) and isinstance(v, (int, str)):
+        print(v)
+except Exception:
+    pass
+PY
+)"
+    fi
+    [[ "$port" =~ ^[0-9]+$ ]] && echo "$port"
+    return 0
+}
+
 # Read the "domain" env-var name from .ws.json. Empty if absent.
 _ws_config_domain_env() {
     _ws_config_get "$1" "domain"
@@ -450,6 +473,7 @@ _set_env_var() {
     if grep -q "^${var}=" "$file" 2>/dev/null; then
         _sed_inplace "s|^${var}=.*|${var}=$(_sed_escape "$value")|" "$file" || true
     else
+        [[ ! -s "$file" || -z "$(tail -c1 "$file")" ]] || echo >> "$file"
         echo "${var}=${value}" >> "$file"
     fi
 }
@@ -665,7 +689,7 @@ _cow_copy() {
 }
 
 # Run a project-level hook if present at .ws/hooks/<event>
-# Expected env: WS_ROOT, optionally WS_PROJECT, WS_BRANCH, WS_SITE, WS_DIR, WS_URL, WS_DB, WS_TEST_DB
+# Expected env: WS_ROOT, optionally WS_PROJECT, WS_BRANCH, WS_SITE, WS_DIR, WS_URL, WS_PORT, WS_DB, WS_TEST_DB
 _run_hook() {
     local event="$1"
     local root="$2"
@@ -679,6 +703,7 @@ _run_hook() {
         WS_SITE="${WS_SITE:-}" \
         WS_DIR="${WS_DIR:-}" \
         WS_URL="${WS_URL:-}" \
+        WS_PORT="${WS_PORT:-}" \
         WS_DB="${WS_DB:-}" \
         WS_TEST_DB="${WS_TEST_DB:-}" \
         WS_PROFILE="${WS_PROFILE:-}" \
@@ -691,6 +716,8 @@ _run_hook() {
 
 PROFILE_LARAVEL="laravel-herd"
 PROFILE_PLAIN="plain"
+PROFILE_NODE="node"
+PROFILE_LIST="laravel-herd|plain|node"
 
 # The profile a workspace was provisioned with, kept next to its base branch
 _set_ws_profile() {
@@ -706,7 +733,7 @@ _get_ws_profile() {
 }
 
 _valid_profile() {
-    [[ "$1" == "$PROFILE_LARAVEL" || "$1" == "$PROFILE_PLAIN" ]]
+    [[ "$1" == "$PROFILE_LARAVEL" || "$1" == "$PROFILE_PLAIN" || "$1" == "$PROFILE_NODE" ]]
 }
 
 # Warn once per run when .ws.json exists but cannot be parsed (its keys are otherwise silently ignored).
@@ -723,8 +750,9 @@ _ws_config_check() {
     fi
 }
 
-# resolve_profile <root> [flag] [branch]: --plain flag, then the profile stored for <branch>,
+# resolve_profile <root> [flag] [branch]: --profile flag, then the profile stored for <branch>,
 # then .ws.json "profile", then detection (artisan → laravel-herd, otherwise plain).
+# node is never detected: a package.json must not turn an existing plain project into node.
 # Unknown values fall back to detection with a warning. Exported as WS_PROFILE.
 resolve_profile() {
     local root="${1:-}" flag="${2:-}" branch="${3:-}"
@@ -737,7 +765,7 @@ resolve_profile() {
         profile="$(_ws_config_get "$root" "profile")"; source=".ws.json"
     fi
     if [[ -n "$profile" ]] && ! _valid_profile "$profile"; then
-        warn "Unknown profile '$profile' in $source (laravel-herd|plain) — detecting instead" >&2
+        warn "Unknown profile '$profile' in $source ($PROFILE_LIST) — detecting instead" >&2
         profile=""
     fi
     if [[ -z "$profile" ]]; then
@@ -753,6 +781,77 @@ resolve_profile() {
 
 _profile_is_plain() {
     [[ "${1:-${WS_PROFILE:-}}" == "$PROFILE_PLAIN" ]]
+}
+
+_profile_is_node() {
+    [[ "${1:-${WS_PROFILE:-}}" == "$PROFILE_NODE" ]]
+}
+
+# Only laravel-herd has a Herd site and databases to provision and tear down
+_profile_has_herd() {
+    [[ "${1:-${WS_PROFILE:-}}" == "$PROFILE_LARAVEL" ]]
+}
+
+# --profile <value> from the command line: an unknown value is a user error
+_parse_profile_flag() {
+    local value="$1"
+    _valid_profile "$value" || fail "Unknown profile '$value' ($PROFILE_LIST)"
+    echo "$value"
+}
+
+# ── Node profile: one dev-server port per workspace ──
+
+_set_ws_port() {
+    local repo="$1" branch="$2" port="$3"
+    [[ -n "$branch" ]] || return 0
+    git -C "$repo" config "branch.${branch}.ws-port" "$port" 2>/dev/null || true
+}
+
+_get_ws_port() {
+    local repo="$1" branch="$2"
+    [[ -n "$branch" ]] || return 0
+    git -C "$repo" config --get "branch.${branch}.ws-port" 2>/dev/null || true
+}
+
+# Base port of the project: PORT in the main checkout .env, else .ws.json "port", else 3000.
+# It belongs to the main checkout and is never handed to a workspace.
+_base_port() {
+    local root="$1" port=""
+    [[ -z "$root" || ! -f "$root/.env" ]] || port="$(_get_env_var "$root/.env" PORT)"
+    [[ "$port" =~ ^[0-9]+$ ]] || port="$(_ws_config_port "$root")"
+    [[ "$port" =~ ^[0-9]+$ ]] || port=3000
+    echo "$port"
+}
+
+_port_recorded() {
+    local root="$1" port="$2"
+    git -C "$root" config --get-regexp '^branch\..*\.ws-port$' 2>/dev/null | awk '{print $2}' | grep -qx "$port"
+}
+
+_port_listening() {
+    local port="$1"
+    if command -v lsof &>/dev/null; then
+        lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+    elif command -v nc &>/dev/null; then
+        nc -z 127.0.0.1 "$port" >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+# Lowest port above the base port that no other branch has recorded and nothing is listening on.
+# <root> gives the base port, <repo> holds the branch.<name>.ws-port records (same repo unless standalone).
+_allocate_port() {
+    local root="$1" repo="${2:-$1}" port
+    port="$(( $(_base_port "$root") + 1 ))"
+    while _port_recorded "$repo" "$port" || _port_listening "$port"; do
+        port=$((port + 1))
+    done
+    echo "$port"
+}
+
+_node_url() {
+    echo "http://localhost:$1"
 }
 
 # ── Workspace record (shared by status, info and JSON events) ──
@@ -781,9 +880,16 @@ _workspace_record() {
     base_ref="$(_resolve_start_point "$root" "$WR_BASE" 2>/dev/null || echo "$WR_BASE")"
     WR_AHEAD="$(git -C "$dir" rev-list --count "$base_ref..HEAD" 2>/dev/null || echo 0)"
     [[ "$WR_AHEAD" =~ ^[0-9]+$ ]] || WR_AHEAD=0
-    WR_URL="" WR_DB="" WR_TEST_DB="" WR_HERD=""
+    WR_URL="" WR_PORT="" WR_DB="" WR_TEST_DB="" WR_HERD=""
     WR_PROFILE="$(resolve_profile "$root" "" "$WR_BRANCH")"
-    _profile_is_plain "$WR_PROFILE" && return 0
+    if _profile_is_node "$WR_PROFILE"; then
+        WR_PORT="$(_get_ws_port "$root" "$WR_BRANCH")"
+        [[ "$WR_PORT" =~ ^[0-9]+$ ]] || WR_PORT="$(_get_env_var "$dir/.env" PORT)"
+        [[ "$WR_PORT" =~ ^[0-9]+$ ]] || WR_PORT=""
+        [[ -z "$WR_PORT" ]] || WR_URL="$(_node_url "$WR_PORT")"
+        return 0
+    fi
+    _profile_has_herd "$WR_PROFILE" || return 0
     if [[ -f "$dir/.env" ]]; then
         WR_URL="$(_get_env_var "$dir/.env" APP_URL)"
         WR_DB="$(_get_env_var "$dir/.env" DB_DATABASE)"
@@ -799,9 +905,14 @@ _workspace_record() {
 # .ws.json subdomain in file order. Needs WR_PROFILE from _workspace_record.
 # Subdomain hosts come from the worktree .env; entries declared after the
 # workspace was created fall back to <prefix>.<site>.test.
+# A node workspace has its single localhost URL and no subdomains.
 _workspace_urls() {
     local root="$1" dir="$2" sname="$3"
-    _profile_is_plain "${WR_PROFILE:-}" && return 0
+    if _profile_is_node "${WR_PROFILE:-}"; then
+        [[ -z "${WR_URL:-}" ]] || printf '|%s\n' "$WR_URL"
+        return 0
+    fi
+    _profile_has_herd "${WR_PROFILE:-}" || return 0
     local main_url proto prefix env_var host
     main_url="$(_get_env_var "$dir/.env" APP_URL)"
     proto="$(site_protocol "$sname")"
@@ -831,6 +942,7 @@ _workspace_json() {
         done < <(_workspace_urls "$WR_ROOT" "$WR_PATH" "$WR_SITE")
         [[ -z "$urls" ]] || json+=",\"urls\":[$urls]"
     fi
+    [[ -z "$WR_PORT" ]]    || json+=",\"port\":$WR_PORT"
     [[ -z "$WR_DB" ]]      || json+=",\"db\":$(_json_str "$WR_DB")"
     [[ -z "$WR_TEST_DB" ]] || json+=",\"test_db\":$(_json_str "$WR_TEST_DB")"
     [[ -z "$WR_HERD" ]]    || json+=",\"herd\":$WR_HERD"
@@ -957,6 +1069,8 @@ cmd_create() {
             --fresh)    fresh="--fresh" ;;
             --no-build) no_build="1" ;;
             --plain)    profile_flag="$PROFILE_PLAIN" ;;
+            --profile)  profile_flag="$(_parse_profile_flag "${2:-}")"; shift ;;
+            --profile=*) profile_flag="$(_parse_profile_flag "${1#--profile=}")" ;;
             --open)     open_after="1" ;;
             --from)    from_flag="${2:-}"; shift ;;
             --from=*)  from_flag="${1#--from=}" ;;
@@ -972,14 +1086,14 @@ cmd_create() {
         shift
     done
 
-    [[ -n "$branch_name" ]] || fail "Usage: ws create <branch-name|pr:NUMBER> [--from <branch>] [--secure] [--fresh] [--no-build] [--plain] [--open] [--agent <cmd>]"
+    [[ -n "$branch_name" ]] || fail "Usage: ws create <branch-name|pr:NUMBER> [--from <branch>] [--secure] [--fresh] [--no-build] [--profile <$PROFILE_LIST>] [--plain] [--open] [--agent <cmd>]"
 
     local root
     root="$(find_project_root)"
     trap _on_provision_exit EXIT
     resolve_profile "$root" "$profile_flag" >/dev/null
-    if _profile_is_plain && [[ -n "$secure$fresh$no_build" ]]; then
-        warn "--secure, --fresh and --no-build have no effect with the plain profile"
+    if ! _profile_has_herd && [[ -n "$secure$fresh$no_build" ]]; then
+        warn "--secure, --fresh and --no-build have no effect with the $WS_PROFILE profile"
     fi
 
     # PR checkout mode: ws create pr:123 → fetch pull/123/head into pr-123, then use it
@@ -1091,6 +1205,8 @@ cmd_setup() {
             --fresh)      fresh="--fresh" ;;
             --no-build)   no_build="1" ;;
             --plain)      profile_flag="$PROFILE_PLAIN" ;;
+            --profile)    profile_flag="$(_parse_profile_flag "${2:-}")"; shift ;;
+            --profile=*)  profile_flag="$(_parse_profile_flag "${1#--profile=}")" ;;
             --from)       source_root="${2:-}"; shift ;;
             --from=*)     source_root="${1#--from=}" ;;
             --name)       name_override="${2:-}"; shift ;;
@@ -1134,8 +1250,8 @@ cmd_setup() {
     fi
 
     resolve_profile "${source_root:-$wt_path}" "$profile_flag" "$branch_name" >/dev/null
-    if _profile_is_plain && [[ -n "$secure$fresh$no_build" ]]; then
-        warn "--secure, --fresh and --no-build have no effect with the plain profile"
+    if ! _profile_has_herd && [[ -n "$secure$fresh$no_build" ]]; then
+        warn "--secure, --fresh and --no-build have no effect with the $WS_PROFILE profile"
     fi
     header "Provisioning workspace: $sname ($WS_PROFILE)"
     [[ -n "$source_root" ]] && info "Source: $source_root"
@@ -1176,8 +1292,8 @@ _provision() {
     proto="$(site_protocol "$sname")"
     [[ "$secure" == "--secure" ]] && proto="https"
     _export_ws_env "$root" "$branch_name" "$sname" "$wt_path"
-    export WS_URL=""
-    _profile_is_plain || export WS_URL="${proto}://${sname}.test"
+    export WS_URL="" WS_PORT=""
+    ! _profile_has_herd || export WS_URL="${proto}://${sname}.test"
     _set_ws_profile "${root:-$wt_path}" "$branch_name" "$WS_PROFILE"
 
     cd "$wt_path" || fail_env "Cannot enter $wt_path"
@@ -1185,7 +1301,9 @@ _provision() {
     _run_hook "pre-create" "$root"
     emit_step hooks done "pre-create"
     emit_step env running
-    if _profile_is_plain; then
+    if _profile_is_node; then
+        _setup_env_node "$root" "${root:-$wt_path}" "$branch_name"
+    elif _profile_is_plain; then
         _setup_env_plain "$root"
     else
         _setup_env "$root" "$sname" "$secure" "$fresh"
@@ -1202,8 +1320,8 @@ _provision() {
         _workspace_record "$root" "$sname"
         emit_event usable "\"workspace\":$(_workspace_json)"
     fi
-    if _profile_is_plain; then
-        info "Plain profile: no database, Herd link or Vite patch"
+    if ! _profile_has_herd; then
+        info "No database, Herd link or Vite patch ($WS_PROFILE profile)"
         emit_step hooks running "post-create"
         _run_hook "post-create" "$root"
         emit_step hooks done "post-create"
@@ -1237,20 +1355,27 @@ _provision() {
 
 _print_summary() {
     local sname="$1" branch_name="$2" wt_path="$3"
-    local proto url
+    local proto url=""
     proto="$(site_protocol "$sname")"
-    url="${proto}://${sname}.test"
+    if _profile_has_herd; then
+        url="${proto}://${sname}.test"
+    elif _profile_is_node && [[ -n "${WS_PORT:-}" ]]; then
+        url="$(_node_url "$WS_PORT")"
+    fi
 
     echo ""
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${GREEN}✓${NC} ${BOLD}Workspace ready!${NC} ${DIM}(${WS_PROFILE:-$PROFILE_LARAVEL})${NC}"
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
-    _profile_is_plain || echo -e "  ${BOLD}URL${NC}       ${CYAN}${url}${NC}"
+    [[ -z "$url" ]] || echo -e "  ${BOLD}URL${NC}       ${CYAN}${url}${NC}"
     echo -e "  ${BOLD}Branch${NC}    ${branch_name}"
     echo -e "  ${BOLD}Path${NC}      ${DIM}${wt_path}${NC}"
+    if _profile_is_node && [[ -n "${WS_PORT:-}" ]]; then
+        echo -e "  ${BOLD}Port${NC}      ${WS_PORT}"
+    fi
 
-    if ! _profile_is_plain; then
+    if _profile_has_herd; then
         if [[ -f "$wt_path/.env" ]]; then
             local ws_db
             ws_db="$(_get_env_var "$wt_path/.env" DB_DATABASE)"
@@ -1266,7 +1391,7 @@ _print_summary() {
     echo -e "  ${DIM}Get started:${NC}          cd ${wt_path}"
     echo -e "  ${DIM}Launch agent here:${NC}    ws run"
     echo -e "  ${DIM}Launch in new tab:${NC}    ws open ${branch_name}"
-    _profile_is_plain || echo -e "  ${DIM}Open in browser:${NC}      ws preview"
+    [[ -z "$url" ]] || echo -e "  ${DIM}Open in browser:${NC}      ws preview"
     echo -e "  ${DIM}When done:${NC}            ws finish ${branch_name}  ${DIM}# PR / merge / abandon, then cleanup${NC}"
     echo ""
 }
@@ -1280,6 +1405,27 @@ _setup_env_plain() {
         cp "$root/.env" .env
         success ".env copied from main project"
     fi
+}
+
+# Node profile: the plain .env copy, then a PORT of its own recorded next to the profile.
+# <repo> is where branch.<name>.ws-port lives (the root checkout, or the checkout itself in standalone mode).
+_setup_env_node() {
+    local root="$1" repo="$2" branch_name="$3" port
+    _setup_env_plain "$root"
+    port="$(_get_ws_port "$repo" "$branch_name")"
+    if [[ "$port" =~ ^[0-9]+$ ]]; then
+        info "Port $port kept"
+    else
+        port="$(_allocate_port "$root" "$repo")"
+        _set_ws_port "$repo" "$branch_name" "$port"
+        success "Port $port allocated"
+    fi
+    export WS_PORT="$port"
+    export WS_URL="$(_node_url "$port")"
+    [[ -f ".env" ]] || : > .env
+    _set_env_var .env PORT "$port"
+    success "PORT=$port written to .env"
+    git check-ignore -q .env 2>/dev/null || warn ".env is not ignored by git in this worktree"
 }
 
 _setup_env() {
@@ -2124,6 +2270,10 @@ cmd_status() {
             echo -e "  ${BOLD}$WR_BRANCH${NC}${dirty_flag}  ${CYAN}+$WR_AHEAD${NC}  ${DIM}plain → $WR_PATH${NC}"
             continue
         fi
+        if _profile_is_node "$WR_PROFILE"; then
+            echo -e "  ${BOLD}$WR_BRANCH${NC}${dirty_flag}  ${CYAN}+$WR_AHEAD${NC}  ${DIM}node → ${WR_URL:-$WR_PATH}${NC}"
+            continue
+        fi
         echo -e "  ${BOLD}$WR_BRANCH${NC}${dirty_flag}  ${CYAN}+$WR_AHEAD${NC}  $db_status  $herd_status  ${DIM}→ $url_display${NC}"
 
         while IFS='|' read -r name url; do
@@ -2169,6 +2319,7 @@ cmd_info() {
         [[ -n "$name" ]] || continue
         echo -e "            ${CYAN}${url}${NC}  ${DIM}(${name})${NC}"
     done < <(_workspace_urls "$root" "$WR_PATH" "$sname")
+    [[ -n "$WR_PORT" ]]    && echo -e "  ${BOLD}Port${NC}      ${WR_PORT}"
     [[ -n "$WR_DB" ]]      && echo -e "  ${BOLD}Database${NC}  ${WR_DB}"
     [[ -n "$WR_TEST_DB" ]] && echo -e "  ${BOLD}Test DB${NC}   ${WR_TEST_DB}"
     [[ -n "$WR_HERD" ]]    && echo -e "  ${BOLD}Herd${NC}      $([[ "$WR_HERD" == "true" ]] && echo -e "${GREEN}linked${NC}" || echo -e "${DIM}not linked${NC}")"
@@ -2201,6 +2352,10 @@ cmd_preview() {
 
     _workspace_record "$root" "$sname"
     _profile_is_plain "$WR_PROFILE" && fail "Workspace '$sname' is plain: no Herd site to open."
+    if _profile_is_node "$WR_PROFILE"; then
+        [[ -z "$prefix" ]] || fail "Workspace '$sname' is node: no subdomains."
+        [[ -n "$WR_URL" ]] || fail "Workspace '$sname' has no port recorded: run ws setup in it."
+    fi
 
     local name url target="" names=""
     while IFS='|' read -r name url; do
@@ -2473,7 +2628,7 @@ _cleanup_workspace() {
 
     local profile
     profile="$(resolve_profile "$root" "" "$wt_branch")"
-    if _profile_is_plain "$profile"; then
+    if ! _profile_has_herd "$profile"; then
         keep_db="--keep-db"
     fi
 
@@ -2486,7 +2641,7 @@ _cleanup_workspace() {
         success "Vite processes killed"
     fi
 
-    if ! _profile_is_plain "$profile" && command -v herd &>/dev/null; then
+    if _profile_has_herd "$profile" && command -v herd &>/dev/null; then
         _herd_links_reset
         herd unsecure "$sname" 2>/dev/null || true
         herd unlink "$sname" 2>/dev/null && \
@@ -2500,7 +2655,7 @@ _cleanup_workspace() {
         done < <(_ws_config_subdomains "$root")
     fi
 
-    if _profile_is_plain "$profile"; then
+    if ! _profile_has_herd "$profile"; then
         :
     elif [[ "$keep_db" == "--keep-db" ]]; then
         info "Database kept"
@@ -2692,16 +2847,17 @@ cmd_help() {
     echo -e "      --secure                        HTTPS via herd secure"
     echo -e "      --fresh                         Empty DB + migrate + seed (default: clone main DB)"
     echo -e "      --no-build                      Skip the front asset build (default: npm run build when Vite is used)"
-    echo -e "      --plain                         Worktree + deps only, no DB, Herd or Vite (auto on non-Laravel repos)"
+    echo -e "      --profile <$PROFILE_LIST>  Provisioning profile (default: .ws.json, else detected)"
+    echo -e "      --plain                         Same as --profile plain: worktree + deps only, no DB, Herd or Vite"
     echo -e "      --open                          Open the agent in a new terminal tab when ready"
     echo -e "      --agent <cmd> [-- args]         Agent to launch (default: claude)"
-    echo -e "  ws setup [--from <repo>] [--name <site>] [--secure] [--fresh] [--no-build] [--plain] [--standalone]"
+    echo -e "  ws setup [--from <repo>] [--name <site>] [--secure] [--fresh] [--no-build] [--profile <$PROFILE_LIST>] [--plain] [--standalone]"
     echo -e "                                      Provision the current checkout as a workspace"
     echo -e "  ws run [branch] [--agent <cmd>] [-- args]   Launch the agent in the workspace"
     echo -e "  ws open [branch] [--agent <cmd>] [-- args]  Same, in a new terminal tab/window"
     echo -e "  ws status                           Show all workspaces and their state"
     echo -e "  ws info [branch]                    Show one workspace"
-    echo -e "  ws preview [branch] [subdomain]     Open the site (or one of its .ws.json subdomains) in the browser"
+    echo -e "  ws preview [branch] [subdomain]     Open the site (a .ws.json subdomain, or the node dev URL) in the browser"
     echo -e "  ws finish|merge [branch] [--into <branch>]  Finish work (PR / merge / abandon)"
     echo -e "      --into <branch>                 Target branch (default: the branch the workspace was created from)"
     echo -e "      --pr | --merge | --abandon      Skip the menu and every prompt"
@@ -2744,7 +2900,9 @@ cmd_help() {
     echo -e "${BOLD}Config (.ws.json at repo root):${NC}"
     echo -e "  ${DIM}{ \"agent\": \"claude\", \"terminal\": \"iterm\", \"profile\": \"laravel-herd\",${NC}"
     echo -e "  ${DIM}  \"domain\": \"APP_DOMAIN\", \"subdomains\": { \"admin\": \"FILAMENT_DOMAIN\" },${NC}"
-    echo -e "  ${DIM}  \"files\": [\"db-prod.toml\"], \"build\": false }${NC}"
+    echo -e "  ${DIM}  \"files\": [\"db-prod.toml\"], \"build\": false, \"port\": 3000 }${NC}"
+    echo -e "  profile: ${DIM}$PROFILE_LIST${NC} (node: plain + one dev-server port per workspace, written as PORT in .env)"
+    echo -e "  port: ${DIM}base dev-server port for node (default: PORT in the main .env, else 3000); workspaces get the next free ones${NC}"
     echo -e "  files: ${DIM}gitignored files symlinked from the main checkout into each workspace${NC}"
     echo -e "  build: ${DIM}false | \"<command>\" (default: npm run build when package.json has a build script and Vite is used)${NC}"
     echo -e "  terminal: ${DIM}tmux | iterm | terminal | ghostty | none${NC} (auto-detected by default)"
@@ -2754,7 +2912,7 @@ cmd_help() {
     echo -e "  Drop executables in ${CYAN}.ws/hooks/${NC} at the repo root to run on lifecycle events:"
     echo -e "  ${DIM}pre-create, post-create, pre-destroy, post-finish${NC}"
     echo -e "  Env available to hooks: ${DIM}WS_PROJECT, WS_BRANCH, WS_SITE, WS_DIR, WS_ROOT, WS_EVENT, WS_PROFILE,${NC}"
-    echo -e "                          ${DIM}WS_URL, WS_DB, WS_TEST_DB (create hooks), WS_BASE (post-finish)${NC}"
+    echo -e "                          ${DIM}WS_URL, WS_PORT, WS_DB, WS_TEST_DB (create hooks), WS_BASE (post-finish)${NC}"
     echo ""
 }
 

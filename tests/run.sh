@@ -590,6 +590,204 @@ case_setup_deps_surfaces_death_after_both_finished() {
     assert_eq 1 "$(printf '%s\n' "$out" | grep -c 'node_modules/ cloned')" "npm outcome still reported"
 }
 
+case_set_env_var_appends_after_missing_newline() {
+    local file="$TMP/no-newline.env"
+    printf 'AA_API_KEY=secret' > "$file"
+    _set_env_var "$file" PORT 3001
+    assert_eq "secret" "$(_get_env_var "$file" AA_API_KEY)" "previous variable intact"
+    assert_eq "3001" "$(_get_env_var "$file" PORT)" "PORT appended on its own line"
+    assert_eq 2 "$(wc -l < "$file" | tr -d ' ')" "line count"
+}
+
+# ── Node profile ──
+
+case_ws_config_port_values() {
+    assert_eq "3100" "$(_ws_config_port "$(make_root port-number '{"port": 3100}')")" "number"
+    assert_eq "3200" "$(_ws_config_port "$(make_root port-string '{"port": "3200"}')")" "numeric string"
+    assert_eq "" "$(_ws_config_port "$(make_root port-text '{"port": "dev"}')")" "non-numeric string"
+    assert_eq "" "$(_ws_config_port "$(make_root port-bool '{"port": true}')")" "boolean"
+    assert_eq "" "$(_ws_config_port "$(make_root port-absent '{"profile": "node"}')")" "absent"
+    assert_eq "" "$(_ws_config_port "$(make_root port-no-config)")" "no .ws.json"
+}
+
+case_base_port_env_then_config_then_default() {
+    local root
+    root="$(make_root base-env '{"port": 3100}')"
+    echo 'PORT=4000' > "$root/.env"
+    assert_eq 4000 "$(_base_port "$root")" "PORT in .env wins"
+    root="$(make_root base-config '{"port": 3100}')"
+    echo 'APP_NAME=x' > "$root/.env"
+    assert_eq 3100 "$(_base_port "$root")" ".ws.json port when .env has no PORT"
+    root="$(make_root base-default '{"profile": "node"}')"
+    assert_eq 3000 "$(_base_port "$root")" "default"
+    assert_eq 3000 "$(_base_port "")" "no root"
+}
+
+case_allocate_port_skips_recorded_and_listening_ports() {
+    local root
+    root="$(make_repo alloc-skip '{"port": 5000}')"
+    _port_listening() { return 1; }
+    assert_eq 5001 "$(_allocate_port "$root")" "first port above the base"
+    git -C "$root" config branch.feat/a.ws-port 5001
+    git -C "$root" config branch.feat/b.ws-port 5002
+    assert_eq 5003 "$(_allocate_port "$root")" "recorded ports skipped"
+    _port_listening() { [[ "$1" == 5003 ]]; }
+    assert_eq 5004 "$(_allocate_port "$root")" "listening port skipped"
+}
+
+case_allocate_port_never_hands_out_the_base_port() {
+    local root
+    root="$(make_repo alloc-base '{"profile": "node"}')"
+    echo 'PORT=3000' > "$root/.env"
+    _port_listening() { return 1; }
+    assert_eq 3001 "$(_allocate_port "$root")" "base port left to the main checkout"
+}
+
+# Node workspace: git repo with a worktree on feat-<name>, PORT=<base> in the main .env
+make_node_project() {
+    local name="$1" sname="$2" root
+    root="$(make_project "$name" '{"profile": "node", "subdomains": {"cp": "CP_DOMAIN"}}' "$sname")"
+    echo 'PORT=3000' > "$root/.env"
+    echo "$root"
+}
+
+case_setup_env_node_replaces_port_line() {
+    local root wt sname="node-replace-wt"
+    root="$(make_node_project node-replace "$sname")"
+    wt="$root/.worktrees/$sname"
+    printf 'APP_NAME=x\nPORT=3000\nOTHER=1\n' > "$wt/.env"
+    _port_listening() { return 1; }
+    (cd "$wt" && _setup_env_node "$root" "$root" "feat-node-replace" > /dev/null 2>&1) || return 1
+    assert_eq "$(printf 'APP_NAME=x\nPORT=3001\nOTHER=1')" "$(cat "$wt/.env")" ".env content"
+    assert_eq 3001 "$(git -C "$root" config --get branch.feat-node-replace.ws-port)" "recorded port"
+}
+
+case_setup_env_node_appends_port_line() {
+    local root wt sname="node-append-wt"
+    root="$(make_node_project node-append "$sname")"
+    wt="$root/.worktrees/$sname"
+    printf 'APP_NAME=x\n' > "$wt/.env"
+    _port_listening() { return 1; }
+    (cd "$wt" && _setup_env_node "$root" "$root" "feat-node-append" > /dev/null 2>&1) || return 1
+    assert_eq "$(printf 'APP_NAME=x\nPORT=3001')" "$(cat "$wt/.env")" ".env content"
+}
+
+case_setup_env_node_copies_main_env_then_sets_port() {
+    local root wt sname="node-copy-wt"
+    root="$(make_node_project node-copy "$sname")"
+    wt="$root/.worktrees/$sname"
+    printf 'PORT=3000\nAPI_URL=http://api.test\n' > "$root/.env"
+    _port_listening() { return 1; }
+    (cd "$wt" && _setup_env_node "$root" "$root" "feat-node-copy" > /dev/null 2>&1) || return 1
+    assert_eq "$(printf 'PORT=3001\nAPI_URL=http://api.test')" "$(cat "$wt/.env")" ".env copied from main, PORT replaced"
+    assert_eq 3000 "$(_get_env_var "$root/.env" PORT)" "main .env untouched"
+}
+
+case_setup_env_node_creates_env_when_none() {
+    local root wt sname="node-create-wt"
+    root="$(make_node_project node-create "$sname")"
+    wt="$root/.worktrees/$sname"
+    rm -f "$root/.env"
+    _port_listening() { return 1; }
+    (cd "$wt" && _setup_env_node "$root" "$root" "feat-node-create" > /dev/null 2>&1) || return 1
+    assert_eq "PORT=3001" "$(cat "$wt/.env")" ".env with the single PORT line"
+}
+
+case_setup_env_node_keeps_recorded_port() {
+    local root wt sname="node-keep-wt"
+    root="$(make_node_project node-keep "$sname")"
+    wt="$root/.worktrees/$sname"
+    git -C "$root" config branch.feat-node-keep.ws-port 3007
+    _port_listening() { return 1; }
+    (cd "$wt" && _setup_env_node "$root" "$root" "feat-node-keep" > /dev/null 2>&1) || return 1
+    assert_eq "PORT=3007" "$(cat "$wt/.env")" "recorded port reused"
+    assert_eq 3007 "$(git -C "$root" config --get branch.feat-node-keep.ws-port)" "record unchanged"
+}
+
+case_setup_env_node_warns_when_env_is_tracked() {
+    local root wt sname="node-warn-wt" out
+    root="$(make_node_project node-warn "$sname")"
+    wt="$root/.worktrees/$sname"
+    _port_listening() { return 1; }
+    out="$(cd "$wt" && _setup_env_node "$root" "$root" "feat-node-warn" 2>&1)" || return 1
+    assert_eq 1 "$(printf '%s\n' "$out" | grep -c 'not ignored by git')" "warning without .gitignore"
+    echo '.env' > "$wt/.gitignore"
+    out="$(cd "$wt" && _setup_env_node "$root" "$root" "feat-node-warn" 2>&1)" || return 1
+    assert_eq 0 "$(printf '%s\n' "$out" | grep -c 'not ignored by git')" "no warning once ignored"
+}
+
+case_resolve_profile_accepts_node() {
+    local root
+    root="$(make_root resolve-config '{"profile": "node"}')"
+    assert_eq "node" "$(resolve_profile "$root" "" "" 2>/dev/null)" ".ws.json"
+    assert_eq "plain" "$(resolve_profile "$root" "plain" "" 2>/dev/null)" "flag wins over .ws.json"
+    root="$(make_root resolve-flag '{"profile": "plain"}')"
+    assert_eq "node" "$(resolve_profile "$root" "node" "" 2>/dev/null)" "flag"
+    root="$(make_repo resolve-branch '{"profile": "plain"}')"
+    git -C "$root" config branch.feat/n.ws-profile node
+    assert_eq "node" "$(resolve_profile "$root" "" "feat/n" 2>/dev/null)" "recorded profile wins over .ws.json"
+}
+
+case_resolve_profile_never_detects_node() {
+    local root
+    root="$(make_root resolve-detect)"
+    echo '{"name": "app"}' > "$root/package.json"
+    assert_eq "plain" "$(resolve_profile "$root" "" "" 2>/dev/null)" "package.json alone stays plain"
+}
+
+case_profile_flag_parsing() {
+    local root rc=0
+    root="$(make_repo flag-parse '{}')"
+    (cd "$root" && WS_JSON="" bash "$WS_BIN" create feat/space --profile node >/dev/null 2>&1) || return 1
+    assert_eq "node" "$(git -C "$root" config --get branch.feat/space.ws-profile)" "--profile node"
+    (cd "$root" && WS_JSON="" bash "$WS_BIN" create feat/equals --profile=node >/dev/null 2>&1) || return 1
+    assert_eq "node" "$(git -C "$root" config --get branch.feat/equals.ws-profile)" "--profile=node"
+    (cd "$root" && WS_JSON="" bash "$WS_BIN" create feat/alias --plain >/dev/null 2>&1) || return 1
+    assert_eq "plain" "$(git -C "$root" config --get branch.feat/alias.ws-profile)" "--plain alias"
+    (cd "$root" && WS_JSON="" bash "$WS_BIN" create feat/bad --profile foo >/dev/null 2>&1) || rc=$?
+    assert_eq 1 "$rc" "unknown profile exit code"
+    [[ ! -d "$root/.worktrees/flag-parse-feat-bad" ]] || { echo "    unknown profile: expected no worktree"; return 1; }
+}
+
+case_status_json_node_record() {
+    local root sname="ws-test-json-node" out
+    root="$(make_node_project json-node "$sname")"
+    git -C "$root" config branch.feat-json-node.ws-port 3005
+    out="$(status_json "$root")"
+    assert_eq 1 "$(printf '%s' "$out" | grep -c '"profile":"node","url":"http://localhost:3005","urls":\[{"url":"http://localhost:3005"}\],"port":3005}')" "url, urls and port"
+    assert_eq 0 "$(printf '%s' "$out" | grep -c '"db"\|"test_db"\|"herd"\|"name":"cp"')" "no db, herd or subdomain"
+}
+
+case_status_json_node_falls_back_to_env_port() {
+    local root sname="ws-test-json-node-env" out
+    root="$(make_node_project json-node-env "$sname")"
+    echo 'PORT=3009' > "$root/.worktrees/$sname/.env"
+    out="$(status_json "$root")"
+    assert_eq 1 "$(printf '%s' "$out" | grep -c '"url":"http://localhost:3009",.*"port":3009')" "port from the worktree .env"
+}
+
+case_status_json_node_without_port_has_no_url() {
+    local root sname="ws-test-json-node-none" out
+    root="$(make_node_project json-node-none "$sname")"
+    out="$(status_json "$root")"
+    assert_eq 1 "$(printf '%s' "$out" | grep -c '"profile":"node"')" "node record"
+    assert_eq 0 "$(printf '%s' "$out" | grep -c '"url\|"port"')" "no url, urls or port"
+}
+
+case_create_json_node_steps_and_records() {
+    local root out sname="create-node-feat-node"
+    root="$(make_repo create-node '{"profile": "node", "port": 4100}')"
+    out="$(cd "$root" && WS_JSON="" bash "$WS_BIN" create feat/node --json 2>/dev/null)" || return 1
+    assert_eq "worktree hooks env deps hooks" "$(printf '%s\n' "$out" | sed -n 's/^{"step":"\([a-z_]*\)","status":"done".*/\1/p' | tr '\n' ' ' | sed 's/ $//')" "step order"
+    assert_eq 0 "$(printf '%s\n' "$out" | grep -c '"step":"db"\|"step":"herd"\|"step":"vite"')" "no Laravel steps"
+    # Patterns live in variables: bash 3.2 brace-expands them inside a quoted $(...)
+    local record='"profile":"node","url":"http://localhost:4101","urls":\[{"url":"http://localhost:4101"}\],"port":4101}}$'
+    assert_eq 1 "$(printf '%s\n' "$out" | grep -c "^{\"event\":\"usable\",\"workspace\":{\"site\":\"$sname\",.*$record")" "usable record"
+    assert_eq 1 "$(printf '%s\n' "$out" | tail -1 | grep -c "^{\"event\":\"ready\",\"workspace\":{\"site\":\"$sname\",.*$record")" "ready record"
+    assert_eq "PORT=4101" "$(cat "$root/.worktrees/$sname/.env")" "worktree .env"
+    assert_eq 4101 "$(git -C "$root" config --get branch.feat/node.ws-port)" "recorded port"
+}
+
 run_case() {
     local name="$1" rc
     set +e
@@ -645,6 +843,24 @@ run_case case_setup_herd_failed_main_link_skips_the_rest
 run_case case_setup_deps_clones_vendor_and_node_modules_concurrently
 run_case case_setup_deps_reports_both_outcomes
 run_case case_setup_deps_surfaces_death_after_both_finished
+run_case case_set_env_var_appends_after_missing_newline
+run_case case_ws_config_port_values
+run_case case_base_port_env_then_config_then_default
+run_case case_allocate_port_skips_recorded_and_listening_ports
+run_case case_allocate_port_never_hands_out_the_base_port
+run_case case_setup_env_node_replaces_port_line
+run_case case_setup_env_node_appends_port_line
+run_case case_setup_env_node_copies_main_env_then_sets_port
+run_case case_setup_env_node_creates_env_when_none
+run_case case_setup_env_node_keeps_recorded_port
+run_case case_setup_env_node_warns_when_env_is_tracked
+run_case case_resolve_profile_accepts_node
+run_case case_resolve_profile_never_detects_node
+run_case case_profile_flag_parsing
+run_case case_status_json_node_record
+run_case case_status_json_node_falls_back_to_env_port
+run_case case_status_json_node_without_port_has_no_url
+run_case case_create_json_node_steps_and_records
 
 echo "$PASSED passed, $FAILED failed"
 [[ $FAILED -eq 0 ]]
