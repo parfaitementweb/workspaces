@@ -6,7 +6,7 @@ set -euo pipefail
 # Creates isolated worktrees with Herd, DB, and auto dependencies
 # ─────────────────────────────────────────────
 
-VERSION="3.7.0"
+VERSION="3.7.1"
 WORKTREES_DIR=".worktrees"
 DEFAULT_AGENT="claude"
 # herd secure needs <host>.test within the 64-char TLS common name
@@ -1014,7 +1014,7 @@ _open_terminal() {
             local escaped="${shell_cmd//\\/\\\\}"
             escaped="${escaped//\"/\\\"}"
             osascript >/dev/null <<EOF
-tell application "iTerm2"
+tell application id "com.googlecode.iterm2"
     activate
     if (count of windows) = 0 then
         set w to (create window with default profile)
